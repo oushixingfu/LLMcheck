@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -25,10 +26,33 @@ from llmcheck.preprocess import (
     DEFAULT_PDF_PAGE_CHUNK_SIZE,
 )
 
+try:
+    from llmcheck.profiles import DEFAULT_PROFILE_ID, get_profile, list_profiles
+except ModuleNotFoundError:
+    DEFAULT_PROFILE_ID = "general_standard_document"
+
+    class _FallbackProfile:
+        def __init__(self, profile_id: str) -> None:
+            self.id = profile_id
+
+    def get_profile(profile_id: str | None = None) -> _FallbackProfile:
+        normalized = (profile_id or DEFAULT_PROFILE_ID).strip() or DEFAULT_PROFILE_ID
+        ids = {profile["id"] for profile in list_profiles()}
+        if normalized not in ids:
+            raise ValueError(f"未知文档 profile: {normalized}. 可用 profile: {', '.join(sorted(ids))}")
+        return _FallbackProfile(normalized)
+
+    def list_profiles() -> list[dict[str, object]]:
+        return [
+            {"id": "general_standard_document", "label": "通用标准文档", "description": "通用文档默认配置"},
+            {"id": "technical_manual", "label": "技术手册", "description": "技术手册与工程规范"},
+        ]
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="llmcheck", description="Markdown LLM correction and acceptance workflow.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    profile_choices = [str(profile["id"]) for profile in list_profiles()]
 
     run = subparsers.add_parser("run", help="Run LLMcheck on a Markdown file or directory.")
     run.add_argument("--input", required=True, type=Path, help="Supported file or directory: md/pdf/image/Office.")
@@ -55,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--ppx-backend", default="default")
     run.add_argument("--ppx-ocr", default="auto")
     run.add_argument("--ppx-formula", default="no")
+    run.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_choices)
 
     batch = subparsers.add_parser("batch", help="Run LLMcheck one book at a time for a source directory.")
     batch.add_argument("--source-dir", required=True, type=Path)
@@ -84,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--ppx-backend", default="default")
     batch.add_argument("--ppx-ocr", default="auto")
     batch.add_argument("--ppx-formula", default="no")
+    batch.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_choices)
     batch.add_argument("--force", action="store_true")
 
     gui = subparsers.add_parser("gui", help="Start the LLMcheck GUI server.")
@@ -93,8 +119,12 @@ def main(argv: list[str] | None = None) -> int:
     mineru_status = subparsers.add_parser("mineru-status", help="Summarize MinerU segment progress for one book output directory.")
     mineru_status.add_argument("--book-output-dir", required=True, type=Path)
     mineru_status.add_argument("--book-name", default="")
+    subparsers.add_parser("profiles", help="List built-in document profiles.")
 
     args = parser.parse_args(argv)
+    if args.command == "profiles":
+        print(json.dumps({"default_profile_id": DEFAULT_PROFILE_ID, "profiles": list_profiles()}, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "mineru-status":
         print(json.dumps(summarize_book_output(args.book_output_dir, book_name=args.book_name), ensure_ascii=False, indent=2))
         return 0
@@ -103,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
             report = process_documents(
                 input_path=args.input,
                 output_dir=args.output_dir,
-                settings=LlmCheckSettings(
+                settings=_make_settings(
                     llm_api_url=args.llm_api_url,
                     llm_api_key=args.llm_api_key,
                     llm_model=args.llm_model,
@@ -127,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
                     ppx_backend=args.ppx_backend,
                     ppx_ocr=args.ppx_ocr,
                     ppx_formula=args.ppx_formula,
+                    **_profile_settings_kwargs(args.profile),
                 ),
             )
         except LlmCheckError as error:
@@ -156,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _settings_from_args(args: argparse.Namespace) -> LlmCheckSettings:
-    return LlmCheckSettings(
+    return _make_settings(
         llm_api_url=args.llm_api_url,
         llm_api_key=args.llm_api_key,
         llm_model=args.llm_model,
@@ -180,7 +211,23 @@ def _settings_from_args(args: argparse.Namespace) -> LlmCheckSettings:
         ppx_backend=args.ppx_backend,
         ppx_ocr=args.ppx_ocr,
         ppx_formula=args.ppx_formula,
+        **_profile_settings_kwargs(args.profile),
     )
+
+
+def _profile_settings_kwargs(profile_id: str | None) -> dict[str, str]:
+    return {"profile_id": get_profile(profile_id).id}
+
+
+def _make_settings(**kwargs: object) -> LlmCheckSettings:
+    field_names = {field.name for field in dataclasses.fields(LlmCheckSettings)}
+    profile_id = str(kwargs.pop("profile_id"))
+    if "profile_id" in field_names:
+        kwargs["profile_id"] = profile_id
+        return LlmCheckSettings(**kwargs)  # type: ignore[arg-type]
+    settings = LlmCheckSettings(**kwargs)  # type: ignore[arg-type]
+    object.__setattr__(settings, "profile_id", profile_id)
+    return settings
 
 
 def _print_progress_event(event: dict[str, object]) -> None:

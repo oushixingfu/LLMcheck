@@ -19,7 +19,16 @@ from llmcheck.preprocess import (
     PreprocessSettings,
     prepare_markdown_inputs,
 )
-from llmcheck.quality import clean_markdown_text, quality_errors, quality_hints, repair_acceptance_locally, safe_stem
+from llmcheck.profiles import DEFAULT_PROFILE_ID, DocumentProfile, get_profile
+from llmcheck.quality import (
+    clean_markdown_text,
+    final_acceptance_report,
+    finalize_standard_document,
+    quality_errors,
+    quality_hints,
+    repair_acceptance_locally,
+    safe_stem,
+)
 
 
 class LlmCheckError(RuntimeError):
@@ -39,6 +48,7 @@ class LlmCheckSettings:
     llm_api_url: str
     llm_api_key: str
     llm_model: str
+    profile_id: str = DEFAULT_PROFILE_ID
     concurrency: int = DEFAULT_LLM_CONCURRENCY
     timeout_seconds: int = 600
     llm_chunk_chars: int = DEFAULT_LLM_CHUNK_CHARS
@@ -72,6 +82,9 @@ class DocumentResult:
     correction_report_path: str = ""
     acceptance_report_path: str = ""
     repair_report_path: str = ""
+    profile_id: str = ""
+    finalization_report_path: str = ""
+    final_acceptance_report_path: str = ""
     char_count: int = 0
     sha256: str = ""
     error: str = ""
@@ -95,6 +108,7 @@ def process_documents(
     client: Any | None = None,
     preprocess_runner: Any | None = None,
 ) -> dict[str, Any]:
+    profile = get_profile(settings.profile_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     process_dir = output_dir / PROCESS_DIR_NAME
     docs = (
@@ -137,6 +151,7 @@ def process_documents(
         "passed_count": sum(1 for result in ordered if result.status == "passed"),
         "failed_count": sum(1 for result in ordered if result.status != "passed"),
         "model": settings.llm_model,
+        "profile_id": profile.id,
         "concurrency": worker_count,
         "documents": [result.to_dict() for result in ordered],
     }
@@ -172,10 +187,13 @@ def process_one_document(
     repair_report = reports_dir / f"{document_id}.llm_repair.json"
     local_repair_report = reports_dir / f"{document_id}.local_repair.json"
     quality_report = reports_dir / f"{document_id}.quality.json"
+    finalization_report = reports_dir / f"{document_id}.finalization.json"
+    final_acceptance_report_path = reports_dir / f"{document_id}.final_acceptance.json"
     draft_path = drafts_dir / f"{document_id}.md"
     final_path = final_dir / f"{document_id}.md"
     pdf_path = pdf_dir / f"{document_id}.pdf"
     pdf_title = document_title or path.stem
+    profile = get_profile(settings.profile_id)
 
     try:
         source_text = path.read_text(encoding="utf-8", errors="replace")
@@ -184,6 +202,7 @@ def process_one_document(
             "source_path": str(path),
             "input_sha256": _sha256(source_text),
             "cleaned_sha256": _sha256(cleaned),
+            "profile_id": profile.id,
             "llm_chunk_chars": max(MIN_LLM_CHUNK_CHARS, settings.llm_chunk_chars),
             "llm_chunk_count": len(split_text_chunks(cleaned, max_chars=settings.llm_chunk_chars)),
             "errors": quality_errors(cleaned),
@@ -199,6 +218,7 @@ def process_one_document(
             concurrency=settings.concurrency,
             max_chars=settings.llm_chunk_chars,
             chunk_report_dir=reports_dir / f"{document_id}.llm_correction_chunks",
+            profile=profile,
         )
         _write_json(correction_report, correction)
         if correction.get("draft_ready") is not True:
@@ -207,11 +227,19 @@ def process_one_document(
                 source_path=str(path),
                 status="correction_failed",
                 correction_report_path=str(correction_report),
+                profile_id=profile.id,
                 error=str(correction.get("llm_result", {}).get("error") or correction.get("status") or "LLM 纠错未通过"),
             )
         corrected_text = clean_markdown_text(str(correction.get("corrected_text") or ""))
         if not corrected_text:
-            return DocumentResult(document_id=document_id, source_path=str(path), status="empty_corrected_text", error="LLM corrected_text 为空")
+            return DocumentResult(
+                document_id=document_id,
+                source_path=str(path),
+                status="empty_corrected_text",
+                correction_report_path=str(correction_report),
+                profile_id=profile.id,
+                error="LLM corrected_text 为空",
+            )
         draft_path.write_text(corrected_text, encoding="utf-8")
         acceptance = accept_text_concurrently(
             source_name=path.name,
@@ -222,6 +250,7 @@ def process_one_document(
             concurrency=settings.concurrency,
             max_chars=settings.llm_chunk_chars,
             chunk_report_dir=reports_dir / f"{document_id}.llm_acceptance_chunks",
+            profile=profile,
         )
         _write_json(acceptance_report, acceptance)
         if acceptance.get("accepted") is not True:
@@ -239,23 +268,24 @@ def process_one_document(
                     concurrency=settings.concurrency,
                     max_chars=settings.llm_chunk_chars,
                     chunk_report_dir=reports_dir / f"{document_id}.llm_acceptance_chunks",
+                    profile=profile,
                 )
                 _write_json(acceptance_report, acceptance)
                 if acceptance.get("accepted") is True:
-                    final_path.write_text(corrected_text, encoding="utf-8")
-                    write_text_pdf(pdf_path, title=pdf_title, text=corrected_text)
-                    return DocumentResult(
+                    return _finalize_and_write_document(
                         document_id=document_id,
                         source_path=str(path),
-                        status="passed",
-                        final_markdown_path=str(final_path),
-                        text_pdf_path=str(pdf_path),
-                        draft_path=str(draft_path),
-                        correction_report_path=str(correction_report),
-                        acceptance_report_path=str(acceptance_report),
-                        repair_report_path=str(local_repair_report),
-                        char_count=len(corrected_text),
-                        sha256=_sha256(corrected_text),
+                        corrected_text=corrected_text,
+                        draft_path=draft_path,
+                        final_path=final_path,
+                        pdf_path=pdf_path,
+                        pdf_title=pdf_title,
+                        correction_report=correction_report,
+                        acceptance_report=acceptance_report,
+                        repair_report=local_repair_report,
+                        finalization_report=finalization_report,
+                        final_acceptance_report_path=final_acceptance_report_path,
+                        profile=profile,
                     )
             repair_rounds = max(0, settings.acceptance_repair_rounds)
             for repair_round in range(1, repair_rounds + 1):
@@ -271,6 +301,7 @@ def process_one_document(
                     repair_rounds=settings.acceptance_repair_rounds,
                     repair_report_dir=reports_dir / f"{document_id}.llm_repair_chunks",
                     audit_text=_load_preprocess_audit_text(path),
+                    profile=profile,
                 )
                 repair["round"] = repair_round
                 _write_json(repair_report, repair)
@@ -287,6 +318,7 @@ def process_one_document(
                     concurrency=settings.concurrency,
                     max_chars=settings.llm_chunk_chars,
                     chunk_report_dir=reports_dir / f"{document_id}.llm_acceptance_chunks",
+                    profile=profile,
                 )
                 _write_json(acceptance_report, acceptance)
                 if acceptance.get("accepted") is not True:
@@ -304,23 +336,24 @@ def process_one_document(
                             concurrency=settings.concurrency,
                             max_chars=settings.llm_chunk_chars,
                             chunk_report_dir=reports_dir / f"{document_id}.llm_acceptance_chunks",
+                            profile=profile,
                         )
-                        _write_json(acceptance_report, acceptance)
+                _write_json(acceptance_report, acceptance)
                 if acceptance.get("accepted") is True:
-                    final_path.write_text(corrected_text, encoding="utf-8")
-                    write_text_pdf(pdf_path, title=pdf_title, text=corrected_text)
-                    return DocumentResult(
+                    return _finalize_and_write_document(
                         document_id=document_id,
                         source_path=str(path),
-                        status="passed",
-                        final_markdown_path=str(final_path),
-                        text_pdf_path=str(pdf_path),
-                        draft_path=str(draft_path),
-                        correction_report_path=str(correction_report),
-                        acceptance_report_path=str(acceptance_report),
-                        repair_report_path=str(repair_report),
-                        char_count=len(corrected_text),
-                        sha256=_sha256(corrected_text),
+                        corrected_text=corrected_text,
+                        draft_path=draft_path,
+                        final_path=final_path,
+                        pdf_path=pdf_path,
+                        pdf_title=pdf_title,
+                        correction_report=correction_report,
+                        acceptance_report=acceptance_report,
+                        repair_report=repair_report,
+                        finalization_report=finalization_report,
+                        final_acceptance_report_path=final_acceptance_report_path,
+                        profile=profile,
                     )
             return DocumentResult(
                 document_id=document_id,
@@ -330,24 +363,83 @@ def process_one_document(
                 correction_report_path=str(correction_report),
                 acceptance_report_path=str(acceptance_report),
                 repair_report_path=str(repair_report if repair_report.exists() else local_repair_report),
+                profile_id=profile.id,
                 error=str(acceptance.get("llm_result", {}).get("summary") or acceptance.get("status") or "LLM 验收未通过"),
             )
-        final_path.write_text(corrected_text, encoding="utf-8")
-        write_text_pdf(pdf_path, title=pdf_title, text=corrected_text)
-        return DocumentResult(
+        return _finalize_and_write_document(
             document_id=document_id,
             source_path=str(path),
-            status="passed",
-            final_markdown_path=str(final_path),
-            text_pdf_path=str(pdf_path),
+            corrected_text=corrected_text,
+            draft_path=draft_path,
+            final_path=final_path,
+            pdf_path=pdf_path,
+            pdf_title=pdf_title,
+            correction_report=correction_report,
+            acceptance_report=acceptance_report,
+            repair_report=repair_report if repair_report.exists() else None,
+            finalization_report=finalization_report,
+            final_acceptance_report_path=final_acceptance_report_path,
+            profile=profile,
+        )
+    except Exception as error:  # noqa: BLE001 - one bad document should be reported, not hide the batch state.
+        return DocumentResult(document_id=document_id, source_path=str(path), status="error", profile_id=profile.id, error=str(error))
+
+
+def _finalize_and_write_document(
+    *,
+    document_id: str,
+    source_path: str,
+    corrected_text: str,
+    draft_path: Path,
+    final_path: Path,
+    pdf_path: Path,
+    pdf_title: str,
+    correction_report: Path,
+    acceptance_report: Path,
+    repair_report: Path | None,
+    finalization_report: Path,
+    final_acceptance_report_path: Path,
+    profile: DocumentProfile,
+) -> DocumentResult:
+    finalization = finalize_standard_document(corrected_text)
+    _write_json(finalization_report, finalization)
+    final_text = clean_markdown_text(str(finalization.get("text") or corrected_text))
+    final_acceptance = final_acceptance_report(final_text)
+    _write_json(final_acceptance_report_path, final_acceptance)
+    repair_report_path = str(repair_report) if repair_report is not None and repair_report.exists() else ""
+    if final_acceptance.get("accepted") is not True:
+        draft_path.write_text(final_text, encoding="utf-8")
+        return DocumentResult(
+            document_id=document_id,
+            source_path=source_path,
+            status="final_acceptance_failed",
             draft_path=str(draft_path),
             correction_report_path=str(correction_report),
             acceptance_report_path=str(acceptance_report),
-            char_count=len(corrected_text),
-            sha256=_sha256(corrected_text),
+            repair_report_path=repair_report_path,
+            profile_id=profile.id,
+            finalization_report_path=str(finalization_report),
+            final_acceptance_report_path=str(final_acceptance_report_path),
+            error="whole-document final acceptance failed",
         )
-    except Exception as error:  # noqa: BLE001 - one bad document should be reported, not hide the batch state.
-        return DocumentResult(document_id=document_id, source_path=str(path), status="error", error=str(error))
+    final_path.write_text(final_text, encoding="utf-8")
+    write_text_pdf(pdf_path, title=pdf_title, text=final_text)
+    return DocumentResult(
+        document_id=document_id,
+        source_path=source_path,
+        status="passed",
+        final_markdown_path=str(final_path),
+        text_pdf_path=str(pdf_path),
+        draft_path=str(draft_path),
+        correction_report_path=str(correction_report),
+        acceptance_report_path=str(acceptance_report),
+        repair_report_path=repair_report_path,
+        profile_id=profile.id,
+        finalization_report_path=str(finalization_report),
+        final_acceptance_report_path=str(final_acceptance_report_path),
+        char_count=len(final_text),
+        sha256=_sha256(final_text),
+    )
 
 
 def split_text_chunks(text: str, *, max_chars: int = DEFAULT_LLM_CHUNK_CHARS) -> list[TextChunk]:
@@ -389,7 +481,9 @@ def correct_text_concurrently(
     concurrency: int,
     max_chars: int,
     chunk_report_dir: Path | None = None,
+    profile: DocumentProfile | None = None,
 ) -> dict[str, Any]:
+    document_profile = profile or get_profile()
     chunks = split_text_chunks(text, max_chars=max_chars)
     results = _run_chunk_jobs(
         chunks,
@@ -399,10 +493,12 @@ def correct_text_concurrently(
             text=chunk.text,
             client=client,
             model=model,
+            profile=document_profile,
         ),
         concurrency=concurrency,
         chunk_report_dir=chunk_report_dir,
         report_prefix="correction_chunk",
+        expected_profile_id=document_profile.id,
     )
     failures = [result for result in results if result.get("draft_ready") is not True]
     if failures:
@@ -443,6 +539,7 @@ def correct_text_concurrently(
         "input_sha256": _sha256(text),
         "output_sha256": _sha256(corrected_text),
         "model": model,
+        "profile_id": document_profile.id,
         "status": "draft_ready",
         "draft_ready": True,
         "chunk_count": len(chunks),
@@ -467,7 +564,9 @@ def accept_text_concurrently(
     concurrency: int,
     max_chars: int,
     chunk_report_dir: Path | None = None,
+    profile: DocumentProfile | None = None,
 ) -> dict[str, Any]:
+    document_profile = profile or get_profile()
     chunks = split_text_chunks(text, max_chars=max_chars)
     results = _run_chunk_jobs(
         chunks,
@@ -477,10 +576,12 @@ def accept_text_concurrently(
             text=chunk.text,
             client=client,
             model=model,
+            profile=document_profile,
         ),
         concurrency=concurrency,
         chunk_report_dir=chunk_report_dir,
         report_prefix="acceptance_chunk",
+        expected_profile_id=document_profile.id,
     )
     failures = [result for result in results if result.get("accepted") is not True]
     status = "passed" if not failures else "needs_revision"
@@ -489,6 +590,7 @@ def accept_text_concurrently(
         "text_path": str(text_path),
         "content_sha256": _sha256(text),
         "model": model,
+        "profile_id": document_profile.id,
         "status": status,
         "accepted": not failures,
         "chunk_count": len(chunks),
@@ -515,7 +617,9 @@ def repair_failed_acceptance_chunks(
     repair_rounds: int,
     repair_report_dir: Path | None = None,
     audit_text: str = "",
+    profile: DocumentProfile | None = None,
 ) -> dict[str, Any]:
+    document_profile = profile or get_profile()
     if repair_rounds < 1 or acceptance.get("accepted") is True:
         return {"status": "skipped", "repaired": False, "summary": "无需返修"}
     chunks = split_text_chunks(text, max_chars=max_chars)
@@ -537,7 +641,7 @@ def repair_failed_acceptance_chunks(
             index = int(failed["chunk_index"])
             chunk = chunk_by_index[index]
             report_path = repair_report_dir / f"repair_chunk_{index:03d}.json" if repair_report_dir is not None else None
-            cached = _cached_repair_result(report_path, chunk) if report_path is not None else None
+            cached = _cached_repair_result(report_path, chunk, expected_profile_id=document_profile.id) if report_path is not None else None
             if cached is not None:
                 repair_results.append(cached)
                 repaired_by_index[index] = clean_markdown_text(str(cached["llm_result"].get("repaired_text") or ""))
@@ -554,6 +658,7 @@ def repair_failed_acceptance_chunks(
                     audit_text=_audit_snippet_for_chunk(chunk.text, audit_text),
                     client=client,
                     model=model,
+                    profile=document_profile,
                 )
             ] = (index, chunk, report_path)
         for future in as_completed(futures):
@@ -600,6 +705,7 @@ def _run_chunk_jobs(
     concurrency: int,
     chunk_report_dir: Path | None = None,
     report_prefix: str = "chunk",
+    expected_profile_id: str = "",
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any] | None] = [None] * len(chunks)
     if chunk_report_dir is not None:
@@ -608,7 +714,11 @@ def _run_chunk_jobs(
         futures = {}
         for chunk in chunks:
             report_path = chunk_report_dir / f"{report_prefix}_{chunk.index:03d}.json" if chunk_report_dir is not None else None
-            cached = _cached_chunk_result(report_path, chunk, report_prefix=report_prefix) if report_path is not None else None
+            cached = (
+                _cached_chunk_result(report_path, chunk, report_prefix=report_prefix, expected_profile_id=expected_profile_id)
+                if report_path is not None
+                else None
+            )
             if cached is not None:
                 results[chunk.index - 1] = cached
                 continue
@@ -625,12 +735,14 @@ def _run_chunk_jobs(
     return [result for result in results if result is not None]
 
 
-def _cached_repair_result(path: Path | None, chunk: TextChunk) -> dict[str, Any] | None:
+def _cached_repair_result(path: Path | None, chunk: TextChunk, *, expected_profile_id: str = "") -> dict[str, Any] | None:
     if path is None or not path.exists() or path.stat().st_size == 0:
         return None
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return None
+    if expected_profile_id and result.get("profile_id") != expected_profile_id:
         return None
     if result.get("input_sha256") != _sha256(chunk.text) or result.get("repaired") is not True:
         return None
@@ -640,12 +752,14 @@ def _cached_repair_result(path: Path | None, chunk: TextChunk) -> dict[str, Any]
     return result
 
 
-def _cached_chunk_result(path: Path, chunk: TextChunk, *, report_prefix: str) -> dict[str, Any] | None:
+def _cached_chunk_result(path: Path, chunk: TextChunk, *, report_prefix: str, expected_profile_id: str = "") -> dict[str, Any] | None:
     if not path.exists() or path.stat().st_size == 0:
         return None
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return None
+    if expected_profile_id and result.get("profile_id") != expected_profile_id:
         return None
     content_hash = _sha256(chunk.text)
     if report_prefix.startswith("correction"):

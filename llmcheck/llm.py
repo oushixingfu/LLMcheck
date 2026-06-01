@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 
+from llmcheck.profiles import DocumentProfile, get_profile
 from llmcheck.quality import quality_hints
 
 
@@ -169,16 +170,41 @@ def _split_curl_response(output: str) -> tuple[str, str]:
     return body, status.strip()
 
 
-def build_correction_prompt(*, source_name: str, text_path: Path, text: str) -> str:
+def _profile_prompt_block(profile: DocumentProfile) -> str:
+    def lines(title: str, values: tuple[str, ...]) -> str:
+        if not values:
+            return f"{title}\n- 无\n"
+        return title + "\n" + "\n".join(f"- {value}" for value in values) + "\n"
+
     return (
-        "你是中医 Markdown 文本的保守纠错员。任务：通读本次输入文本，修正 OCR/清洗残留造成的错别字、缺标点、异常分段、正文粘连和强制换行。\n"
+        f"profile_id: {profile.id}\n"
+        f"profile_label: {profile.label}\n"
+        f"profile_description: {profile.description}\n"
+        f"language_hint: {profile.language_hint}\n"
+        + lines("preservation_rules:", profile.preservation_rules)
+        + lines("structure_rules:", profile.structure_rules)
+        + lines("cleanup_rules:", profile.cleanup_rules)
+        + lines("forbidden_changes:", profile.forbidden_changes)
+        + lines("acceptance_checks:", profile.acceptance_checks)
+        + lines("protected_terms:", profile.protected_terms)
+        + lines("glue_markers:", profile.glue_markers)
+    )
+
+
+def build_correction_prompt(*, source_name: str, text_path: Path, text: str, profile: DocumentProfile | None = None) -> str:
+    document_profile = profile or get_profile()
+    return (
+        "你是文档清洗与结构规范化编辑。任务：通读本次输入文本，修正 OCR/清洗残留造成的错别字、缺标点、异常分段、正文粘连、乱码、异常空格和强制换行。\n"
         "\n"
         "硬性规则：\n"
         "1. corrected_text 必须是本次输入文本的完整纠正文，不是摘要或 diff；如果源文件名显示为第 N/M 片段，只返回该片段完整纠正文，不要因为片段边界判定为截断。\n"
-        "2. 只能修正明显 OCR/清洗/排版问题，不得凭医学常识补写原书未出现内容。\n"
-        "3. 不得现代化改写，不得删改医案、处方、剂量、诊断、页码线索中的实质信息。\n"
-        "4. 标题、目录、条目、处方结构可以保留自然换行；普通正文自然段内不得保留 OCR 物理折行。\n"
+        "2. 只能修正明显 OCR/清洗/排版问题，不得补写源文档未出现内容。\n"
+        "3. 不得摘要化、现代化改写或删改事实、数字、术语、编号、页码线索中的实质信息。\n"
+        "4. 标题、目录、条目、表格和关键结构可以保留自然换行；普通正文自然段内不得保留 OCR 物理折行。\n"
         "5. 不确定内容保留原文，并写入 unresolved_issues。\n"
+        "\n"
+        "文档 profile：\n"
+        f"{_profile_prompt_block(document_profile)}"
         "\n"
         "请只返回 JSON，不要 Markdown，不要代码块。格式：\n"
         "{\n"
@@ -197,15 +223,20 @@ def build_correction_prompt(*, source_name: str, text_path: Path, text: str) -> 
     )
 
 
-def build_acceptance_prompt(*, source_name: str, text_path: Path, text: str) -> str:
+def build_acceptance_prompt(*, source_name: str, text_path: Path, text: str, profile: DocumentProfile | None = None) -> str:
+    document_profile = profile or get_profile()
     return (
-        "你是中医 Markdown 文本的最终验收员。请通读本次输入文本，判断该文本是否可以交付给后续知识抽取和人工阅读；如果源文件名显示为第 N/M 片段，只验收该片段，不要因为片段边界判定为截断。\n"
+        "你是标准文档最终验收员。请通读本次输入文本，判断该文本是否可以交付给后续知识抽取和人工阅读；如果源文件名显示为第 N/M 片段，只验收该片段，不要因为片段边界判定为截断。\n"
         "\n"
         "验收标准：\n"
-        "1. 标点、断句、分段达到人类可读；不存在大段正文粘连。\n"
+        "1. 标点、断句、分段达到人类可读；不存在大段正文粘连、乱码或异常空格。\n"
         "2. 普通正文自然段内不得保留 OCR 物理折行。\n"
-        "3. 医案、处方、诊断、按语、治疗结果等结构应尽量清晰。\n"
+        "3. 标题、列表、表格、引用、注释和关键结构应尽量清晰。\n"
         "4. 不要求现代化润色，只判断文本是否忠实、可读、可继续使用。\n"
+        "5. 不应残留强制换行、扫描噪声或无依据扩写。\n"
+        "\n"
+        "文档 profile：\n"
+        f"{_profile_prompt_block(document_profile)}"
         "\n"
         "请只返回 JSON，不要 Markdown，不要代码块。格式：\n"
         "{\n"
@@ -232,7 +263,9 @@ def build_repair_prompt(
     previous_text: str = "",
     next_text: str = "",
     audit_text: str = "",
+    profile: DocumentProfile | None = None,
 ) -> str:
+    document_profile = profile or get_profile()
     context_payload = {
         "acceptance_issue": acceptance_issue,
         "previous_text_excerpt": previous_text[-1200:],
@@ -240,14 +273,17 @@ def build_repair_prompt(
         "audit_text_excerpt": audit_text[:4000],
     }
     return (
-        "你是中医 Markdown 文本的验收返修员。任务：只针对本片段的阻断验收问题，输出本片段完整返修文本。\n"
+        "你是标准文档验收返修员。任务：只针对本片段的阻断验收问题，输出本片段完整返修文本。\n"
         "\n"
         "硬性规则：\n"
         "1. repaired_text 必须是本片段完整文本，不是摘要或 diff。\n"
         "2. 优先依据本片段、相邻片段和 PPX 审计文本修正 OCR/排版/漏识问题。\n"
-        "3. 不得改写医学实质；不得为了通顺大段新增原书未提供内容。\n"
+        "3. 不得改写源文档实质；不得为了通顺大段新增源文档未提供内容。\n"
         "4. 若验收意见指出固定枚举或固定配属缺项，且上下文已经给出完整序列，可按上下文补齐明显缺项，并在 changes 写明依据。\n"
         "5. 若无法可靠修复，保持原文并在 unresolved_issues 说明原因。\n"
+        "\n"
+        "文档 profile：\n"
+        f"{_profile_prompt_block(document_profile)}"
         "\n"
         "请只返回 JSON，不要 Markdown，不要代码块。格式：\n"
         "{\n"
@@ -266,9 +302,18 @@ def build_repair_prompt(
     )
 
 
-def correction_result_payload(*, source_name: str, text_path: Path, text: str, client: Any, model: str) -> dict[str, Any]:
+def correction_result_payload(
+    *,
+    source_name: str,
+    text_path: Path,
+    text: str,
+    client: Any,
+    model: str,
+    profile: DocumentProfile | None = None,
+) -> dict[str, Any]:
+    document_profile = profile or get_profile()
     input_hash = _sha256(text)
-    prompt = build_correction_prompt(source_name=source_name, text_path=text_path, text=text)
+    prompt = build_correction_prompt(source_name=source_name, text_path=text_path, text=text, profile=document_profile)
     result = client.complete_json(prompt)
     corrected = str(result.get("corrected_text") or "")
     status = str(result.get("status") or "error")
@@ -278,6 +323,7 @@ def correction_result_payload(*, source_name: str, text_path: Path, text: str, c
         "text_path": str(text_path),
         "input_sha256": input_hash,
         "prompt_sha256": _sha256(prompt),
+        "profile_id": document_profile.id,
         "model": model,
         "status": status,
         "draft_ready": status in {"draft_ready", "needs_manual_review"} and (bool(corrected.strip()) or empty_corrected_text_allowed),
@@ -288,14 +334,24 @@ def correction_result_payload(*, source_name: str, text_path: Path, text: str, c
     }
 
 
-def acceptance_result_payload(*, source_name: str, text_path: Path, text: str, client: Any, model: str) -> dict[str, Any]:
-    prompt = build_acceptance_prompt(source_name=source_name, text_path=text_path, text=text)
+def acceptance_result_payload(
+    *,
+    source_name: str,
+    text_path: Path,
+    text: str,
+    client: Any,
+    model: str,
+    profile: DocumentProfile | None = None,
+) -> dict[str, Any]:
+    document_profile = profile or get_profile()
+    prompt = build_acceptance_prompt(source_name=source_name, text_path=text_path, text=text, profile=document_profile)
     result = client.complete_json(prompt)
     return {
         "source_name": source_name,
         "text_path": str(text_path),
         "content_sha256": _sha256(text),
         "prompt_sha256": _sha256(prompt),
+        "profile_id": document_profile.id,
         "model": model,
         "status": result.get("status") or "error",
         "accepted": result.get("status") == "passed",
@@ -314,7 +370,9 @@ def repair_result_payload(
     audit_text: str,
     client: Any,
     model: str,
+    profile: DocumentProfile | None = None,
 ) -> dict[str, Any]:
+    document_profile = profile or get_profile()
     prompt = build_repair_prompt(
         source_name=source_name,
         text_path=text_path,
@@ -323,6 +381,7 @@ def repair_result_payload(
         previous_text=previous_text,
         next_text=next_text,
         audit_text=audit_text,
+        profile=document_profile,
     )
     result = client.complete_json(prompt)
     repaired = str(result.get("repaired_text") or "")
@@ -332,6 +391,7 @@ def repair_result_payload(
         "text_path": str(text_path),
         "input_sha256": _sha256(text),
         "prompt_sha256": _sha256(prompt),
+        "profile_id": document_profile.id,
         "model": model,
         "status": status,
         "repaired": status in {"repaired", "needs_manual_review"} and bool(repaired.strip()),

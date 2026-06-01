@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 import base64
 import copy
+import dataclasses
+import html
 import json
 import tempfile
 import threading
@@ -23,6 +25,28 @@ from llmcheck.preprocess import (
     DEFAULT_PDF_PAGE_CHUNK_SIZE,
     SUPPORTED_SUFFIXES,
 )
+
+try:
+    from llmcheck.profiles import DEFAULT_PROFILE_ID, get_profile, list_profiles
+except ModuleNotFoundError:
+    DEFAULT_PROFILE_ID = "general_standard_document"
+
+    class _FallbackProfile:
+        def __init__(self, profile_id: str) -> None:
+            self.id = profile_id
+
+    def get_profile(profile_id: str | None = None) -> _FallbackProfile:
+        normalized = (profile_id or DEFAULT_PROFILE_ID).strip() or DEFAULT_PROFILE_ID
+        ids = {profile["id"] for profile in list_profiles()}
+        if normalized not in ids:
+            raise ValueError(f"未知文档 profile: {normalized}. 可用 profile: {', '.join(sorted(ids))}")
+        return _FallbackProfile(normalized)
+
+    def list_profiles() -> list[dict[str, object]]:
+        return [
+            {"id": "general_standard_document", "label": "通用标准文档", "description": "通用文档默认配置"},
+            {"id": "technical_manual", "label": "技术手册", "description": "技术手册与工程规范"},
+        ]
 
 
 class JobStore:
@@ -171,7 +195,11 @@ def create_app() -> FastAPI:
             return JSONResponse({"status": "failed", "error": "缺少输出目录"}, status_code=400)
         output_dir = Path(output_dir_value).expanduser()
         input_path = _save_uploaded_files(payload, output_dir=output_dir) or Path(str(payload.get("input_path") or "")).expanduser()
-        settings = LlmCheckSettings(
+        try:
+            profile_id = get_profile(str(payload.get("profile") or DEFAULT_PROFILE_ID)).id
+        except ValueError as error:
+            return JSONResponse({"status": "failed", "error": str(error)}, status_code=400)
+        settings = _make_settings(
             llm_api_url=str(payload.get("llm_api_url") or ""),
             llm_api_key=str(payload.get("llm_api_key") or ""),
             llm_model=str(payload.get("llm_model") or ""),
@@ -194,6 +222,7 @@ def create_app() -> FastAPI:
             ppx_backend=str(payload.get("ppx_backend") or "default"),
             ppx_ocr=str(payload.get("ppx_ocr") or "auto"),
             ppx_formula=str(payload.get("ppx_formula") or "no"),
+            profile_id=profile_id,
         )
         if not settings.llm_api_url or not settings.llm_api_key or not settings.llm_model:
             return JSONResponse({"status": "failed", "error": "缺少 LLM API url/key/model"}, status_code=400)
@@ -265,6 +294,9 @@ def _read_mineru_segment_status(book_output_dir: Path, *, book_name: str) -> dic
 
 
 def render_index_html() -> str:
+    profile_options = "\n".join(
+        _profile_option(str(profile["id"]), str(profile.get("label") or profile["id"])) for profile in list_profiles()
+    )
     return """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -276,7 +308,7 @@ def render_index_html() -> str:
     main { max-width: 920px; margin: 32px auto; padding: 0 20px; }
     section { background: white; border: 1px solid #d9dee7; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
     label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; }
-    input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #c8cfda; border-radius: 6px; }
+    input, select { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #c8cfda; border-radius: 6px; }
     button { margin-top: 16px; padding: 10px 14px; border: 0; border-radius: 6px; background: #155eef; color: white; font-weight: 700; cursor: pointer; }
     progress { width: 100%; height: 18px; }
     pre { white-space: pre-wrap; background: #111827; color: #f9fafb; padding: 12px; border-radius: 6px; min-height: 120px; }
@@ -294,6 +326,10 @@ def render_index_html() -> str:
     <input id="input_path" placeholder="/path/to/file-or-directory" />
     <label for="output_dir">输出目录</label>
     <input id="output_dir" placeholder="/path/to/output" />
+    <label for="profile">文档 Profile</label>
+    <select id="profile" name="profile">
+__PROFILE_OPTIONS__
+    </select>
   </section>
   <section>
     <label for="llm_api_url">LLM API URL</label>
@@ -382,6 +418,7 @@ document.getElementById('start').onclick = async () => {
   const payload = {
     input_path: document.getElementById('input_path').value,
     output_dir: document.getElementById('output_dir').value,
+    profile: document.getElementById('profile').value,
     llm_api_url: document.getElementById('llm_api_url').value,
     llm_api_key: document.getElementById('llm_api_key').value,
     llm_model: document.getElementById('llm_model').value,
@@ -423,4 +460,22 @@ document.getElementById('start').onclick = async () => {
 };
 </script>
 </body>
-</html>"""
+</html>""".replace("__PROFILE_OPTIONS__", profile_options)
+
+
+def _profile_option(profile_id: str, label: str) -> str:
+    selected = " selected" if profile_id == DEFAULT_PROFILE_ID else ""
+    escaped_id = html.escape(profile_id, quote=True)
+    escaped_label = html.escape(label, quote=True)
+    return f'      <option value="{escaped_id}"{selected}>{escaped_label} ({escaped_id})</option>'
+
+
+def _make_settings(**kwargs: object) -> LlmCheckSettings:
+    field_names = {field.name for field in dataclasses.fields(LlmCheckSettings)}
+    profile_id = str(kwargs.pop("profile_id"))
+    if "profile_id" in field_names:
+        kwargs["profile_id"] = profile_id
+        return LlmCheckSettings(**kwargs)  # type: ignore[arg-type]
+    settings = LlmCheckSettings(**kwargs)  # type: ignore[arg-type]
+    object.__setattr__(settings, "profile_id", profile_id)
+    return settings

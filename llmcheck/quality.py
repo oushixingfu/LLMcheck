@@ -5,6 +5,9 @@ from typing import Any
 
 
 BAD_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")
+MOJIBAKE_PATTERNS = ("锟斤拷", "Ã", "Â", "â€™", "â€œ", "â€�")
+ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+FORCED_LINE_BREAK_RE = re.compile(r"(?<![。！？.!?：:；;])\n(?!\n|#{1,6}\s|[-*+]\s|\d+[.)、]\s|\|)")
 MINERU_FLOWCHART_DETAILS_RE = re.compile(
     r"\n*<details>\s*<summary>\s*flowchart\s*</summary>(?P<body>.*?)</details>\s*",
     re.IGNORECASE | re.DOTALL,
@@ -33,6 +36,23 @@ STRUCTURE_LABELS = (
     "足部：",
 )
 LOCAL_REPAIR_CATEGORIES = {"layout", "ocr_noise", "punctuation", "missing_text"}
+FINAL_BLOCKING_ERROR_CODES = {
+    "bad_control_characters",
+    "mojibake",
+    "replacement_characters",
+    "zero_width_characters",
+    "abnormal_cjk_spaces",
+    "forced_line_breaks",
+    "duplicate_repeated_lines",
+}
+QUALITY_ERROR_HINTS = {
+    "mojibake": "检测到典型编码乱码，请回到原始文本或 OCR 结果修复后再交付。",
+    "replacement_characters": "检测到 Unicode 替换字符 �，说明源文本存在无法识别的字符。",
+    "zero_width_characters": "检测到零宽字符，建议删除不可见字符后重新验收。",
+    "abnormal_cjk_spaces": "检测到中文字符之间的异常连续空格，建议合并为正常中文文本。",
+    "forced_line_breaks": "检测到疑似 OCR 物理折行残留，建议合并为自然段落。",
+    "duplicate_repeated_lines": "检测到短行重复出现，可能是重复页眉、页脚或扫描噪声。",
+}
 
 
 def clean_markdown_text(text: str) -> str:
@@ -332,6 +352,11 @@ def quality_hints(text: str) -> dict[str, Any]:
         "line_count": len(lines),
         "punctuation_count": punctuation_count,
         "punctuation_density": round(punctuation_count / max(1, chinese_chars), 4),
+        "error_hints": {
+            error: QUALITY_ERROR_HINTS[error]
+            for error in _deterministic_quality_errors(text)
+            if error in QUALITY_ERROR_HINTS
+        },
         "forced_line_break_candidate_count": len(forced_line_break_candidates(text)),
         "forced_line_break_samples": forced,
         "long_low_punctuation_line_count": len(low_punctuation_lines),
@@ -353,7 +378,41 @@ def quality_errors(text: str) -> list[str]:
         errors.append("forced_line_break_residue")
     if BAD_CONTROL_RE.search(text):
         errors.append("bad_control_characters")
+    errors.extend(error for error in _deterministic_quality_errors(text) if error not in errors)
     return errors
+
+
+def finalize_standard_document(text: str) -> dict[str, object]:
+    before = clean_markdown_text(text)
+    without_repeated, removed_lines = _remove_repeated_running_lines(before)
+    finalized = clean_markdown_text(_normalize_heading_spacing(without_repeated))
+    changes: list[dict[str, object]] = []
+    if removed_lines:
+        changes.append({"kind": "removed_repeated_lines", "lines": removed_lines})
+    if finalized != before and not changes:
+        changes.append({"kind": "normalized_spacing"})
+    elif finalized != before and changes:
+        changes.append({"kind": "normalized_spacing"})
+    return {
+        "status": "finalized",
+        "finalized": finalized != before,
+        "input_sha256": _text_sha256(before),
+        "output_sha256": _text_sha256(finalized),
+        "changes": changes,
+        "text": finalized,
+    }
+
+
+def final_acceptance_report(text: str) -> dict[str, object]:
+    errors = quality_errors(text)
+    blocking = [error for error in errors if error in FINAL_BLOCKING_ERROR_CODES]
+    return {
+        "status": "passed" if not blocking else "needs_revision",
+        "accepted": not blocking,
+        "blocking_errors": blocking,
+        "warnings": [error for error in errors if error not in blocking],
+        "hints": quality_hints(text),
+    }
 
 
 def forced_line_break_candidates(text: str, *, limit: int | None = None) -> list[dict[str, object]]:
@@ -372,6 +431,56 @@ def forced_line_break_candidates(text: str, *, limit: int | None = None) -> list
 def safe_stem(value: str) -> str:
     stem = re.sub(r"[\\/:*?\"<>|\s]+", "_", value).strip("._")
     return stem or "document"
+
+
+def _deterministic_quality_errors(text: str) -> list[str]:
+    errors: list[str] = []
+    if any(pattern in text for pattern in MOJIBAKE_PATTERNS):
+        errors.append("mojibake")
+    if "�" in text:
+        errors.append("replacement_characters")
+    if ZERO_WIDTH_RE.search(text):
+        errors.append("zero_width_characters")
+    if re.search(r"[\u4e00-\u9fff] {2,}[\u4e00-\u9fff]", text):
+        errors.append("abnormal_cjk_spaces")
+    if _has_general_forced_line_break(text):
+        errors.append("forced_line_breaks")
+    if _has_repeated_short_lines(text):
+        errors.append("duplicate_repeated_lines")
+    return errors
+
+
+def _has_repeated_short_lines(text: str) -> bool:
+    counts: dict[str, int] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if 3 <= len(line) <= 40 and not line.startswith(("#", "|")):
+            counts[line] = counts.get(line, 0) + 1
+    return any(count >= 3 for count in counts.values())
+
+
+def _remove_repeated_running_lines(text: str) -> tuple[str, list[str]]:
+    lines = text.splitlines()
+    counts: dict[str, int] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if 3 <= len(line) <= 40 and not line.startswith(("#", "|", "-", "*")):
+            counts[line] = counts.get(line, 0) + 1
+    repeated = {line for line, count in counts.items() if count >= 2}
+    output = [raw_line for raw_line in lines if raw_line.strip() not in repeated]
+    return "\n".join(output) + ("\n" if output else ""), sorted(repeated)
+
+
+def _normalize_heading_spacing(text: str) -> str:
+    normalized = re.sub(r"(^|\n)(#{1,6}\s+[^\n]+)\n(?!\n)", r"\1\2\n\n", text)
+    normalized = re.sub(r"(?<!\n)\n(#{1,6}\s+[^\n]+)", r"\n\n\1", normalized)
+    return normalized
+
+
+def _text_sha256(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _merge_soft_wrapped_lines(lines: list[str]) -> list[str]:
@@ -399,3 +508,28 @@ def _looks_like_forced_break(previous: str, current: str) -> bool:
     if len(previous) < 8 or len(current) < 8:
         return False
     return bool(re.search(r"[\u3400-\u9fff]$", previous) and re.search(r"^[\u3400-\u9fff]", current))
+
+
+def _has_general_forced_line_break(text: str) -> bool:
+    for match in FORCED_LINE_BREAK_RE.finditer(text):
+        previous = text[: match.start()].rsplit("\n", 1)[-1].strip()
+        current = text[match.end() :].split("\n", 1)[0].strip()
+        if _looks_like_general_paragraph_fragment(previous, current):
+            return True
+    return False
+
+
+def _looks_like_general_paragraph_fragment(previous: str, current: str) -> bool:
+    if len(previous) < 8 or len(current) < 8:
+        return False
+    if previous.startswith(("#", "|")) or current.startswith(("#", "|")):
+        return False
+    if current.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+[.)、]\s*", current):
+        return False
+    if previous.endswith(tuple("。！？.!?：:；;”』】)）`")):
+        return False
+    cjk_boundary = bool(re.search(r"[\u3400-\u9fff]$", previous) and re.search(r"^[\u3400-\u9fff]", current))
+    comma_boundary = previous.endswith(("，", ",", "、"))
+    if not cjk_boundary and not comma_boundary and len(previous) + len(current) < 80:
+        return False
+    return bool(re.search(r"[\u3400-\u9fffA-Za-z0-9，,、]$", previous) and re.search(r"^[\u3400-\u9fffA-Za-z0-9]", current))

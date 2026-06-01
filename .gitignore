@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/*
+!dist/LLMcheck-GUI-0.1.1.exe
+!dist/llmcheck-skill-0.1.1.tar.gz
+*.egg-info/
+*.pyc
+/.llmcheck_uploads/
+/output/
+.env
+.env.*
+!.env.example
+tmp/
+.codegraph-auto-init.lock

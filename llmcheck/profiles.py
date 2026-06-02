@@ -18,6 +18,8 @@ class DocumentProfile:
     acceptance_checks: tuple[str, ...]
     protected_terms: tuple[str, ...] = ()
     glue_markers: tuple[str, ...] = ()
+    table_headers: tuple[tuple[str, ...], ...] = ()
+    structure_labels: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -130,6 +132,31 @@ BUILTIN_PROFILES: tuple[DocumentProfile, ...] = (
             "肩部：",
             "肘部：",
             "腕手部：",
+            "髋部：",
+            "膝部：",
+            "踝部：",
+            "足部：",
+        ),
+        table_headers=(
+            ("分类", "药名", "功效", "主治", "用量"),
+            ("类别", "药名", "功效", "主治", "用量"),
+            ("方名", "出处", "组成", "功效", "主治", "用法"),
+            ("方名", "来源", "药物组成", "功效", "主治", "制用法"),
+        ),
+        structure_labels=(
+            "头部：",
+            "面部：",
+            "项部：",
+            "颈部：",
+            "肩部：",
+            "背部：",
+            "胸部：",
+            "腹部：",
+            "腰部：",
+            "肘部：",
+            "腕部：",
+            "手部：",
+            "髀部：",
             "髋部：",
             "膝部：",
             "踝部：",

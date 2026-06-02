@@ -436,7 +436,21 @@ def _latest_state_rows(path: Path, *, valid_sources: set[str]) -> list[BatchItem
         if source_key not in valid_sources:
             continue
         latest[source_key] = row
-    return sorted(latest.values(), key=lambda row: row.index)
+    rows = sorted(latest.values(), key=lambda row: row.index)
+    # Auto-compact: if the jsonl has more than 2x the deduplicated row count, rewrite it.
+    total_lines = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    if total_lines > len(rows) * 2:
+        _compact_jsonl(path, rows)
+    return rows
+
+
+def _compact_jsonl(path: Path, rows: list[BatchItem]) -> None:
+    """Rewrite the jsonl file keeping only the latest row per source."""
+    tmp_path = path.with_name(f"{path.name}.compact")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+    tmp_path.replace(path)
 
 
 def _emit_progress(callback: ProgressCallback | None, event: dict[str, Any]) -> None:

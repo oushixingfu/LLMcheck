@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 import hashlib
 import http.client
@@ -18,6 +19,46 @@ from llmcheck.profiles import DocumentProfile, get_profile
 from llmcheck.quality import quality_hints
 
 
+class CircuitBreaker:
+    """Tracks consecutive LLM failures and opens the circuit after a threshold.
+
+    When open, all calls are rejected immediately (fast-fail) until the
+    recovery timeout elapses, at which point a single half-open probe is
+    allowed.  A successful probe resets the breaker to closed.
+    """
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 5,
+        recovery_timeout_seconds: float = 60.0,
+    ) -> None:
+        self._failure_threshold = max(1, failure_threshold)
+        self._recovery_timeout = recovery_timeout_seconds
+        self._consecutive_failures = 0
+        self._opened_at: float = 0.0
+        self._lock = Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._consecutive_failures < self._failure_threshold:
+                return False
+            if time.monotonic() - self._opened_at >= self._recovery_timeout:
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failure_threshold:
+                self._opened_at = time.monotonic()
+
+
 @dataclass(frozen=True)
 class LlmConfig:
     api_url: str
@@ -29,6 +70,14 @@ class LlmConfig:
 class LlmClient:
     def __init__(self, config: LlmConfig) -> None:
         self.config = config
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=int(os.environ.get("LLMCHECK_CIRCUIT_FAILURE_THRESHOLD", "5")),
+            recovery_timeout_seconds=float(os.environ.get("LLMCHECK_CIRCUIT_RECOVERY_SECONDS", "60")),
+        )
+
+    @property
+    def circuit_breaker(self) -> CircuitBreaker:
+        return self._circuit_breaker
 
     def _max_attempts(self) -> int:
         raw_value = os.environ.get("LLMCHECK_LLM_RETRIES")
@@ -40,9 +89,14 @@ class LlmClient:
             return 3
 
     def complete_json(self, prompt: str) -> dict[str, Any]:
-        if os.environ.get("LLMCHECK_LLM_TRANSPORT") == "curl":
-            return self._complete_json_with_curl(prompt)
-        return self._complete_json_with_urllib(prompt)
+        if self._circuit_breaker.is_open:
+            return {"status": "error", "error": "LLM circuit breaker is open (consecutive failures exceeded threshold)"}
+        result = self._complete_json_with_curl(prompt) if os.environ.get("LLMCHECK_LLM_TRANSPORT") == "curl" else self._complete_json_with_urllib(prompt)
+        if result.get("status") == "error":
+            self._circuit_breaker.record_failure()
+        else:
+            self._circuit_breaker.record_success()
+        return result
 
     def _complete_json_with_urllib(self, prompt: str) -> dict[str, Any]:
         url = self.config.api_url.rstrip("/")
@@ -234,6 +288,8 @@ def build_acceptance_prompt(*, source_name: str, text_path: Path, text: str, pro
         "3. 标题、列表、表格、引用、注释和关键结构应尽量清晰。\n"
         "4. 不要求现代化润色，只判断文本是否忠实、可读、可继续使用。\n"
         "5. 不应残留强制换行、扫描噪声或无依据扩写。\n"
+        "6. 保留图片链接、图表占位、无法确认的缺字/疑似原文问题或 unresolved 说明是允许的；不能因为需要回查原图、外部底本或人工校勘才判定为阻断。\n"
+        "7. 对古籍、术语、表格和命盘类内容，不得凭领域知识要求改字、补月份、补表格或重排源文不可确认的内容；只在文本本身明显不可读、乱码化、严重粘连或 Markdown 结构破坏时才标记 needs_revision。\n"
         "\n"
         "文档 profile：\n"
         f"{_profile_prompt_block(document_profile)}"

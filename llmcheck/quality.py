@@ -16,7 +16,7 @@ MINERU_NOISE_DETAILS_RE = re.compile(
     r"\n*<details>\s*<summary>\s*(?:line|text_image|flowchart|natural_image|radar)\s*</summary>.*?</details>\s*",
     re.IGNORECASE | re.DOTALL,
 )
-STRUCTURE_LABELS = (
+DEFAULT_STRUCTURE_LABELS = (
     "头部：",
     "面部：",
     "项部：",
@@ -34,6 +34,12 @@ STRUCTURE_LABELS = (
     "膝部：",
     "踝部：",
     "足部：",
+)
+DEFAULT_TABLE_HEADERS: tuple[tuple[str, ...], ...] = (
+    ("分类", "药名", "功效", "主治", "用量"),
+    ("类别", "药名", "功效", "主治", "用量"),
+    ("方名", "出处", "组成", "功效", "主治", "用法"),
+    ("方名", "来源", "药物组成", "功效", "主治", "制用法"),
 )
 LOCAL_REPAIR_CATEGORIES = {"layout", "ocr_noise", "punctuation", "missing_text"}
 FINAL_BLOCKING_ERROR_CODES = {
@@ -55,17 +61,17 @@ QUALITY_ERROR_HINTS = {
 }
 
 
-def clean_markdown_text(text: str) -> str:
+def clean_markdown_text(text: str, *, structure_labels: tuple[str, ...] | None = None, table_headers: tuple[tuple[str, ...], ...] | None = None) -> str:
     cleaned = text.replace("\ufeff", "").replace("\x0c", "\n")
     cleaned = BAD_CONTROL_RE.sub("", cleaned)
     cleaned = re.sub(r"\r\n?", "\n", cleaned)
     cleaned = _transcribe_table_flowchart_details(cleaned)
     cleaned = MINERU_NOISE_DETAILS_RE.sub("\n\n", cleaned)
     cleaned = _html_table_tags_to_markdown(cleaned)
-    cleaned = _split_local_structure_glue(cleaned)
+    cleaned = _split_local_structure_glue(cleaned, structure_labels=structure_labels)
     lines = [line.rstrip() for line in cleaned.split("\n")]
-    lines = _normalize_markdown_tables(lines)
-    lines = _merge_soft_wrapped_lines(lines)
+    lines = _normalize_markdown_tables(lines, table_headers=table_headers)
+    lines = _merge_soft_wrapped_lines(lines, structure_labels=structure_labels)
     cleaned = "\n".join(lines)
     cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned).strip()
     return cleaned + "\n" if cleaned else ""
@@ -187,9 +193,10 @@ def _flowchart_node_label(raw_value: str) -> str:
     return value.replace("|", "｜").strip()
 
 
-def _split_local_structure_glue(text: str) -> str:
+def _split_local_structure_glue(text: str, *, structure_labels: tuple[str, ...] | None = None) -> str:
+    labels = structure_labels or DEFAULT_STRUCTURE_LABELS
     cleaned = text
-    for label in STRUCTURE_LABELS:
+    for label in labels:
         escaped = re.escape(label)
         cleaned = re.sub(rf"(?<!^)(?<!\n)(?<=[\u3400-\u9fffA-Za-z0-9）)])({escaped})", r"\n\1", cleaned)
     cleaned = re.sub(r"(?<=年版)(?=(?:[\u3400-\u9fff]{2,4})?《)", "\n", cleaned)
@@ -206,7 +213,7 @@ def _html_table_tags_to_markdown(text: str) -> str:
     return cleaned
 
 
-def _normalize_markdown_tables(lines: list[str]) -> list[str]:
+def _normalize_markdown_tables(lines: list[str], *, table_headers: tuple[tuple[str, ...], ...] | None = None) -> list[str]:
     merged: list[str] = []
     index = 0
     while index < len(lines):
@@ -224,7 +231,7 @@ def _normalize_markdown_tables(lines: list[str]) -> list[str]:
         merged.append(line)
         index += 1
 
-    merged = _merge_table_continuation_rows(merged)
+    merged = _merge_table_continuation_rows(merged, known_headers=table_headers)
     normalized: list[str] = []
     for index, line in enumerate(merged):
         stripped = line.strip()
@@ -234,7 +241,7 @@ def _normalize_markdown_tables(lines: list[str]) -> list[str]:
             if _is_table_row(previous) and _is_table_row(following):
                 continue
         normalized.append(line)
-        if _is_known_table_header(stripped):
+        if _is_known_table_header(stripped, known_headers=table_headers):
             following = _next_nonblank(merged, index + 1)
             if not _is_table_separator(following):
                 normalized.append(_table_separator(stripped))
@@ -249,12 +256,12 @@ def _next_nonblank(lines: list[str], start: int) -> str:
     return ""
 
 
-def _merge_table_continuation_rows(lines: list[str]) -> list[str]:
+def _merge_table_continuation_rows(lines: list[str], *, known_headers: tuple[tuple[str, ...], ...] | None = None) -> list[str]:
     normalized: list[str] = []
     active_cols = 0
     for line in lines:
         stripped = line.strip()
-        if _is_known_table_header(stripped):
+        if _is_known_table_header(stripped, known_headers=known_headers):
             active_cols = len(_table_cells(stripped))
             normalized.append(line)
             continue
@@ -264,7 +271,7 @@ def _merge_table_continuation_rows(lines: list[str]) -> list[str]:
             normalized.append(line)
             continue
         cells = _table_cells(stripped)
-        if _has_embedded_table_header(cells):
+        if _has_embedded_table_header(cells, known_headers=known_headers):
             continue
         if normalized and len(cells) < active_cols:
             previous = normalized[-1].strip()
@@ -288,12 +295,14 @@ def _is_table_separator(line: str) -> bool:
     return bool(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", stripped))
 
 
-def _is_known_table_header(line: str) -> bool:
-    return tuple(_table_cells(line)) in _KNOWN_TABLE_HEADERS
+def _is_known_table_header(line: str, *, known_headers: tuple[tuple[str, ...], ...] | None = None) -> bool:
+    headers = known_headers if known_headers is not None else DEFAULT_TABLE_HEADERS
+    return tuple(_table_cells(line)) in headers
 
 
-def _has_embedded_table_header(cells: list[str]) -> bool:
-    for header in _KNOWN_TABLE_HEADERS:
+def _has_embedded_table_header(cells: list[str], *, known_headers: tuple[tuple[str, ...], ...] | None = None) -> bool:
+    headers = known_headers if known_headers is not None else DEFAULT_TABLE_HEADERS
+    for header in headers:
         header_len = len(header)
         for start in range(1, len(cells) - header_len + 1):
             if tuple(cells[start : start + header_len]) == header:
@@ -322,13 +331,6 @@ def _table_separator(header: str) -> str:
     cell_count = max(1, len(header.strip().strip("|").split("|")))
     return "|" + "|".join("---" for _ in range(cell_count)) + "|"
 
-
-_KNOWN_TABLE_HEADERS = (
-    ("分类", "药名", "功效", "主治", "用量"),
-    ("类别", "药名", "功效", "主治", "用量"),
-    ("方名", "出处", "组成", "功效", "主治", "用法"),
-    ("方名", "来源", "药物组成", "功效", "主治", "制用法"),
-)
 
 
 def quality_hints(text: str) -> dict[str, Any]:
@@ -415,13 +417,13 @@ def final_acceptance_report(text: str) -> dict[str, object]:
     }
 
 
-def forced_line_break_candidates(text: str, *, limit: int | None = None) -> list[dict[str, object]]:
+def forced_line_break_candidates(text: str, *, limit: int | None = None, structure_labels: tuple[str, ...] | None = None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     lines = text.splitlines()
     for index in range(len(lines) - 1):
         previous = lines[index].strip()
         current = lines[index + 1].strip()
-        if _looks_like_forced_break(previous, current):
+        if _looks_like_forced_break(previous, current, structure_labels=structure_labels):
             rows.append({"line_number": index + 1, "previous": previous[:120], "current": current[:120]})
             if limit is not None and len(rows) >= limit:
                 break
@@ -483,23 +485,24 @@ def _text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _merge_soft_wrapped_lines(lines: list[str]) -> list[str]:
+def _merge_soft_wrapped_lines(lines: list[str], *, structure_labels: tuple[str, ...] | None = None) -> list[str]:
     result: list[str] = []
     for line in lines:
         stripped = line.strip()
-        if result and stripped and _looks_like_forced_break(result[-1].strip(), stripped):
+        if result and stripped and _looks_like_forced_break(result[-1].strip(), stripped, structure_labels=structure_labels):
             result[-1] = result[-1].rstrip() + stripped
         else:
             result.append(line)
     return result
 
 
-def _looks_like_forced_break(previous: str, current: str) -> bool:
+def _looks_like_forced_break(previous: str, current: str, *, structure_labels: tuple[str, ...] | None = None) -> bool:
+    labels = structure_labels or DEFAULT_STRUCTURE_LABELS
     if not previous or not current:
         return False
     if previous.startswith("#") or current.startswith("#"):
         return False
-    if current.startswith(STRUCTURE_LABELS) or previous.endswith("年版"):
+    if current.startswith(labels) or previous.endswith("年版"):
         return False
     if re.match(r"^([一二三四五六七八九十]+、|\d+[.、])", current):
         return False
@@ -528,8 +531,24 @@ def _looks_like_general_paragraph_fragment(previous: str, current: str) -> bool:
         return False
     if previous.endswith(tuple("。！？.!?：:；;”』】)）`")):
         return False
+    if _looks_like_cjk_numbered_list_line(previous) and _looks_like_cjk_numbered_list_line(current):
+        return False
     cjk_boundary = bool(re.search(r"[\u3400-\u9fff]$", previous) and re.search(r"^[\u3400-\u9fff]", current))
     comma_boundary = previous.endswith(("，", ",", "、"))
+    if comma_boundary and _looks_like_short_cjk_verse_line(previous) and _looks_like_short_cjk_verse_line(current):
+        return False
     if not cjk_boundary and not comma_boundary and len(previous) + len(current) < 80:
         return False
     return bool(re.search(r"[\u3400-\u9fffA-Za-z0-9，,、]$", previous) and re.search(r"^[\u3400-\u9fffA-Za-z0-9]", current))
+
+
+def _looks_like_short_cjk_verse_line(value: str) -> bool:
+    if len(value) > 28:
+        return False
+    if re.search(r"[A-Za-z0-9]", value):
+        return False
+    return bool(re.fullmatch(r"[\u3400-\u9fff，、。！？；：”“‘’（）《》〈〉·]+", value))
+
+
+def _looks_like_cjk_numbered_list_line(value: str) -> bool:
+    return bool(re.match(r"^[一二三四五六七八九十百千〇零两]+、\S+", value))

@@ -1,146 +1,170 @@
 ---
 name: llmcheck
-description: Use when an agent needs to run or explain LLMcheck: a profile-driven CLI/GUI workflow that converts Markdown, PDF, image, and Office files into cleaned standard Markdown, performs conservative LLM correction and acceptance, runs whole-document finalization/final acceptance, emits final Markdown/text PDF delivery folders, and keeps process artifacts under process/.
+description: Convert PDF/Markdown/image/Office documents into gate-checked Markdown via LLMcheck. Use when an agent must run document conversion, inspect job status, fetch only passed final md/, or list profiles through the agent JSON contract.
 ---
 
 # LLMcheck
 
-Use this skill when the user wants to process source documents with LLMcheck, inspect LLMcheck outputs, choose a document profile, or prepare a repeatable command for conversion, cleanup, finalization, and standard-document delivery.
+Use this skill when the user or workflow needs stable document → Markdown conversion with dual-engine acquisition (MinerU API + local PPX), deterministic cleaning, structure normalization, quality gates, and optional LLM review.
 
-## What It Does
+## Install (once per machine)
 
-LLMcheck normalizes supported source files to Markdown, then runs deterministic cleanup, profile-aware chunked LLM correction, chunked LLM acceptance, targeted local repair, optional LLM repair, whole-document finalization, final acceptance, and final artifact generation.
-
-The default profile is `general_standard_document`. Domain behavior is explicit and selectable with `--profile`; Chinese medicine is available as `chinese_medicine_reference`, not the default system identity.
-
-Built-in profiles:
-
-- `general_standard_document`
-- `academic_paper`
-- `technical_manual`
-- `legal_contract`
-- `financial_report`
-- `medical_reference`
-- `chinese_medicine_reference`
-
-Run:
+Agent Skills install (Claude Code / Codex / Cursor-compatible):
 
 ```bash
-llmcheck profiles
+npx skills@latest add oushixingfu/LLMcheck -g -y
 ```
 
-## Supported Inputs
+Manual Claude Code install:
 
-Pass either a single file or a directory to `--input`. Directories are scanned recursively for supported files.
+```bash
+git clone https://github.com/oushixingfu/LLMcheck.git /tmp/LLMcheck
+cp -R /tmp/LLMcheck/skill ~/.claude/skills/llmcheck
+```
+
+Install the Python runtime (required — this skill drives the CLI/package):
+
+```bash
+python3.12 -m pip install "git+https://github.com/oushixingfu/LLMcheck.git"
+# or from a local clone:
+# pip install -e /path/to/LLMcheck
+llmcheck agent profiles
+```
+
+## Iron rules
+
+1. Prefer `llmcheck agent convert|status|get-md|profiles` (JSON on stdout).
+2. Only trust final Markdown under `md/` when document `status == "passed"`.
+3. Never treat `process/drafts/**` as delivery content.
+4. Credentials come from environment variables — do not hardcode secrets.
+5. Keep `--output-dir` outside the source tree when possible.
+
+## Credentials (env)
+
+```bash
+export LLM_API_URL="https://api.example.com/v1"   # or OpenAI-compatible base
+export LLM_API_KEY="..."
+export LLM_MODEL="deepseek-v4-pro"                # optional override
+export MINERU_CLOUD_API_TOKEN="..."               # PDF / image / Office
+# optional aliases also accepted: LLMCHECK_*, OPENAI_*, MINERU_API_KEY
+```
+
+Agent convert defaults to `--llm-mode local-gate` so deterministic clean/gates can run without LLM credentials. Use `review-first` only when an LLM reviewer is configured.
+
+## Short workflow
+
+```bash
+llmcheck agent profiles
+
+llmcheck agent convert \
+  --input /path/to/file-or-dir \
+  --output-dir /path/to/output \
+  --profile general_standard_document \
+  --llm-mode local-gate
+
+llmcheck agent status --output-dir /path/to/output
+
+llmcheck agent get-md \
+  --output-dir /path/to/output \
+  --document-id <document_id> \
+  --max-chars 4000
+```
+
+Python equivalent:
+
+```python
+from llmcheck import agent_api
+
+print(agent_api.list_profiles())
+report = agent_api.submit_convert(
+    input_path="/path/to/file",
+    output_dir="/path/to/output",
+    llm_mode="local-gate",
+)
+job = agent_api.get_job(output_dir="/path/to/output")
+doc_id = job["documents"][0]["document_id"]
+md = agent_api.get_final_markdown(output_dir="/path/to/output", document_id=doc_id)
+```
+
+## Pipeline (what the tool does)
+
+```text
+upload/path
+→ dual acquisition (MinerU API ∥ local PPX)
+→ Cross Select → process/.../cross/initial.md
+→ deterministic clean + structure
+→ pre-LLM gate
+→ optional LLM (local-gate skips)
+→ final gate
+→ md/ only if accepted
+```
+
+## JobReport (`schema_version=1.0`)
+
+```json
+{
+  "schema_version": "1.0",
+  "job_id": "...",
+  "status": "passed|review_required|failed|running",
+  "profile_id": "general_standard_document",
+  "documents": [
+    {
+      "document_id": "...",
+      "status": "passed",
+      "final_markdown_path": ".../md/x.md",
+      "final_markdown_sha256": "...",
+      "final_acceptance_report_path": "...",
+      "cross_report_path": "...",
+      "error": ""
+    }
+  ],
+  "artifacts": {
+    "md_dir": ".../md",
+    "process_dir": ".../process"
+  }
+}
+```
+
+## Exit codes
+
+- `0` — passed / successful read
+- `1` — review_required, failed, or non-passed get-md
+- `2` — clear config/input error
+
+## Delivery policy
+
+| Status | Agent may use |
+|--------|----------------|
+| `passed` | `md/<id>.md` via path or `get-md` body |
+| `review_required` / `failed` | reports under `process/` only — no final body |
+
+`get-md` returns text only for passed documents.
+
+## Profiles
+
+Default: `general_standard_document`.
+
+Also: `academic_paper`, `technical_manual`, `legal_contract`, `financial_report`, `medical_reference`, `chinese_medicine_reference`.
+
+## Supported inputs
 
 - Markdown: `.md`
 - PDF: `.pdf`
 - Images: `.png`, `.jpg`, `.jpeg`, `.jp2`, `.webp`, `.gif`, `.bmp`
 - Office: `.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`
 
-Input flow:
+## Trigger phrases
 
-- Markdown enters cleanup, correction, acceptance, finalization, and final acceptance directly.
-- PDF starts local PPX audit and MinerU API VLM in parallel. MinerU is the formal text source for cleanup and final output; PPX Markdown is retained only for audit/reference and repair context.
-- MinerU splits PDFs into page chunks by `--pdf-page-chunk-size`, default `30`, submits chunks concurrently, and merges MinerU chunk Markdown back in page order.
-- Images and Office files go directly to MinerU API VLM without PPX.
+Use this skill when the user says things like:
 
-## CLI
+- "用 LLMcheck 转成 md"
+- "convert this PDF to clean markdown"
+- "run document quality gates"
+- "llmcheck agent convert …"
 
-Run one file or one directory as a single LLMcheck job:
+## Notes
 
-```bash
-llmcheck run \
-  --profile general_standard_document \
-  --input /path/to/file-or-directory \
-  --output-dir /path/to/output \
-  --llm-api-url http://127.0.0.1:3022 \
-  --llm-api-key "$LLM_API_KEY" \
-  --llm-model gpt-5.5 \
-  --mineru-api-key "$MINERU_CLOUD_API_TOKEN" \
-  --mineru-concurrency 12 \
-  --pdf-page-chunk-size 30 \
-  --llm-chunk-chars 2000 \
-  --concurrency 10
-```
-
-Run a source directory one book at a time:
-
-```bash
-llmcheck batch \
-  --profile technical_manual \
-  --source-dir /mnt/d/pdf \
-  --output-dir /mnt/d/pdf/output \
-  --start-index 1 \
-  --limit 1 \
-  --book-concurrency 1 \
-  --llm-api-url http://127.0.0.1:3022 \
-  --llm-api-key "$LLM_API_KEY" \
-  --llm-model gpt-5.5 \
-  --mineru-api-key "$MINERU_CLOUD_API_TOKEN" \
-  --mineru-concurrency 50 \
-  --mineru-timeout-seconds 14400 \
-  --pdf-page-chunk-size 30 \
-  --llm-chunk-chars 2000 \
-  --concurrency 32
-```
-
-Common options:
-
-- `--profile`: document profile, default `general_standard_document`.
-- `--llm-api-url`: OpenAI-compatible base URL or `/chat/completions` endpoint.
-- `--llm-api-key`: LLM API key.
-- `--llm-model`: model name.
-- `--mineru-api-key`: MinerU API token, or `MINERU_CLOUD_API_TOKEN`.
-- `--concurrency`: LLM chunk correction/acceptance concurrency.
-- `--acceptance-repair-rounds`: LLM repair rounds after failed acceptance.
-
-## Outputs
-
-The output directory has exactly three top-level folders:
-
-```text
-output/
-  md/           # final Markdown for passed documents only
-  文字版pdf/    # text PDF for passed documents only
-  process/      # drafts, preprocessing artifacts, reports, caches, batch state
-```
-
-Only documents whose summary row is `passed` are valid delivery artifacts. Do not use `process/drafts/*.md` as final output.
-
-Important reports under `process/reports/`:
-
-- `*.quality.json`: deterministic cleanup quality errors and hints.
-- `*.llm_correction.json` and `*.llm_correction_chunks/*.json`: correction metadata and chunk cache.
-- `*.llm_acceptance.json` and `*.llm_acceptance_chunks/*.json`: acceptance metadata and chunk cache.
-- `*.local_repair.json`: deterministic local repair metadata.
-- `*.llm_repair.json` and `*.llm_repair_chunks/*.json`: LLM repair metadata.
-- `*.finalization.json`: whole-document finalization changes.
-- `*.final_acceptance.json`: final quality gate before writing `md/` and `文字版pdf/`.
-- `llmcheck_manifest.jsonl`: one document result per line.
-- `llmcheck_summary.json`: single-job status, counts, settings, and document rows.
-- `llmcheck_batch_state.jsonl` and `llmcheck_batch_summary.json`: directory-level batch state and summary.
-
-Final outputs are valid only when:
-
-- `process/reports/llmcheck_summary.json` or `process/llmcheck_batch_summary.json` reports `passed`.
-- Each document row has `status == "passed"`.
-- The corresponding `*.final_acceptance.json` has `accepted == true`.
-
-## Agent Workflow
-
-1. Ask or infer the right profile. Use `general_standard_document` unless the source clearly fits a more specific profile.
-2. Run `llmcheck profiles` if the profile list is needed.
-3. Prepare `llmcheck run` for a single input or `llmcheck batch` for a source directory.
-4. Keep `--output-dir` outside the source directory when possible.
-5. After completion, read the summary first.
-6. If status is not `passed`, inspect the failed row and then its correction, acceptance, repair, finalization, and final acceptance reports.
-7. Use `md/` and `文字版pdf/` only for passed rows.
-
-## Notes And Caveats
-
-- LLMcheck is conservative: it should repair OCR, punctuation, segmentation, abnormal paragraphing, physical line breaks, mojibake, and obvious layout artifacts without summarizing, modernizing, or inventing facts.
-- Profile rules protect domain-specific content such as legal clauses, financial figures, technical commands, medical doses, citations, formulas, tables, and code blocks.
-- Chunk caches are profile-aware. Re-running the same output directory with a different profile should not reuse mismatched chunk results.
-- Batch resume validates final Markdown/PDF artifacts before skipping already passed books.
-- For PDF inputs, MinerU output is the formal text source. PPX is audit/reference material.
+- Runtime dependency: Python ≥3.12 package `LLMcheck` from this repository.
+- Local PPX is optional audit/fallback when configured; MinerU token is required for non-Markdown conversion without cache.
+- Human CLI (`llmcheck run` / `batch` / `gui`) still exists; agents should prefer `llmcheck agent *`.
+- Design: `docs/prd/2026-07-18-agent-callable-dual-engine-pipeline.md` in the repo.

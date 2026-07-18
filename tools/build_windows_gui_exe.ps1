@@ -22,21 +22,15 @@ if (-not (Test-Path $Python)) {
     --clean `
     --noconfirm `
     --onefile `
-    --console `
+    --windowed `
     --name $ExeName `
     --distpath "dist" `
     --workpath "tmp\pyinstaller-build" `
     --specpath "tmp\pyinstaller-spec" `
-    --collect-all fastapi `
-    --collect-all starlette `
-    --collect-all pydantic `
-    --collect-all pydantic_core `
-    --collect-all uvicorn `
-    --collect-all anyio `
-    --hidden-import uvicorn.loops.auto `
-    --hidden-import uvicorn.protocols.http.auto `
-    --hidden-import uvicorn.protocols.websockets.auto `
-    --hidden-import uvicorn.lifespan.on `
+    --hidden-import tkinter `
+    --hidden-import tkinter.ttk `
+    --hidden-import tkinter.filedialog `
+    --hidden-import tkinter.messagebox `
     "llmcheck\gui_exe.py"
 
 Write-Output (Join-Path $Root "dist\$ExeName.exe")

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
+
+import llmcheck.cleaning as cleaning
+from llmcheck.rules import normalize_write_mode, rule_definition
 
 
 BAD_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")
 MOJIBAKE_PATTERNS = ("锟斤拷", "Ã", "Â", "â€™", "â€œ", "â€�")
-ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
-FORCED_LINE_BREAK_RE = re.compile(r"(?<![。！？.!?：:；;])\n(?!\n|#{1,6}\s|[-*+]\s|\d+[.)、]\s|\|)")
+ZERO_WIDTH_RE = re.compile(r"[​‌‍﻿]")
 MINERU_FLOWCHART_DETAILS_RE = re.compile(
     r"\n*<details>\s*<summary>\s*flowchart\s*</summary>(?P<body>.*?)</details>\s*",
     re.IGNORECASE | re.DOTALL,
@@ -41,82 +44,176 @@ DEFAULT_TABLE_HEADERS: tuple[tuple[str, ...], ...] = (
     ("方名", "出处", "组成", "功效", "主治", "用法"),
     ("方名", "来源", "药物组成", "功效", "主治", "制用法"),
 )
-LOCAL_REPAIR_CATEGORIES = {"layout", "ocr_noise", "punctuation", "missing_text"}
-FINAL_BLOCKING_ERROR_CODES = {
-    "bad_control_characters",
-    "mojibake",
-    "replacement_characters",
-    "zero_width_characters",
-    "abnormal_cjk_spaces",
-    "forced_line_breaks",
-    "duplicate_repeated_lines",
-}
-QUALITY_ERROR_HINTS = {
-    "mojibake": "检测到典型编码乱码，请回到原始文本或 OCR 结果修复后再交付。",
-    "replacement_characters": "检测到 Unicode 替换字符 �，说明源文本存在无法识别的字符。",
-    "zero_width_characters": "检测到零宽字符，建议删除不可见字符后重新验收。",
-    "abnormal_cjk_spaces": "检测到中文字符之间的异常连续空格，建议合并为正常中文文本。",
-    "forced_line_breaks": "检测到疑似 OCR 物理折行残留，建议合并为自然段落。",
-    "duplicate_repeated_lines": "检测到短行重复出现，可能是重复页眉、页脚或扫描噪声。",
-}
+clean_markdown_text = cleaning.clean_markdown_text
+clean_markdown_with_report = cleaning.clean_markdown_with_report
+
+def quality_hints(text: str) -> dict[str, Any]:
+    from llmcheck.final_gate import quality_hints as _quality_hints
+
+    return _quality_hints(text)
 
 
-def clean_markdown_text(text: str, *, structure_labels: tuple[str, ...] | None = None, table_headers: tuple[tuple[str, ...], ...] | None = None) -> str:
-    cleaned = text.replace("\ufeff", "").replace("\x0c", "\n")
-    cleaned = BAD_CONTROL_RE.sub("", cleaned)
-    cleaned = re.sub(r"\r\n?", "\n", cleaned)
-    cleaned = _transcribe_table_flowchart_details(cleaned)
-    cleaned = MINERU_NOISE_DETAILS_RE.sub("\n\n", cleaned)
-    cleaned = _html_table_tags_to_markdown(cleaned)
-    cleaned = _split_local_structure_glue(cleaned, structure_labels=structure_labels)
-    lines = [line.rstrip() for line in cleaned.split("\n")]
-    lines = _normalize_markdown_tables(lines, table_headers=table_headers)
-    lines = _merge_soft_wrapped_lines(lines, structure_labels=structure_labels)
-    cleaned = "\n".join(lines)
-    cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned).strip()
-    return cleaned + "\n" if cleaned else ""
+
+def quality_errors(text: str) -> list[str]:
+    from llmcheck.final_gate import quality_errors as _quality_errors
+
+    return _quality_errors(text)
+
+
+
+def finalize_standard_document(text: str) -> dict[str, object]:
+    from llmcheck.structure import finalize_standard_document as _finalize_standard_document
+
+    return _finalize_standard_document(text)
+
+
+
+def final_acceptance_report(text: str) -> dict[str, object]:
+    from llmcheck.final_gate import final_acceptance_report as _final_acceptance_report
+
+    return _final_acceptance_report(text)
+
+
+
+def forced_line_break_candidates(text: str, *, limit: int | None = None, structure_labels: tuple[str, ...] | None = None) -> list[dict[str, object]]:
+    from llmcheck.final_gate import forced_line_break_candidates as _forced_line_break_candidates
+
+    return _forced_line_break_candidates(text, limit=limit, structure_labels=structure_labels)
+
+
+
+def safe_stem(value: str) -> str:
+    return cleaning.safe_stem(value)
+
 
 
 def repair_acceptance_locally(text: str, acceptance: dict[str, Any]) -> dict[str, Any]:
-    issues = _acceptance_blocking_issues(acceptance)
-    targeted = [issue for issue in issues if str(issue.get("category") or "") in LOCAL_REPAIR_CATEGORIES]
-    if not targeted or acceptance.get("accepted") is True:
-        return {"status": "skipped", "repaired": False, "issue_count": len(issues), "summary": "没有可本地定点修复的验收问题"}
+    return cleaning.repair_acceptance_locally(text, acceptance)
 
-    repaired_text = clean_markdown_text(text)
-    changes: list[dict[str, str]] = []
-    for issue in targeted:
-        excerpt = str(issue.get("excerpt") or "").strip()
-        if not excerpt:
-            continue
-        repaired_excerpt = clean_markdown_text(excerpt).strip()
-        if repaired_excerpt and repaired_excerpt != excerpt and excerpt in repaired_text:
-            repaired_text = repaired_text.replace(excerpt, repaired_excerpt, 1)
-            changes.append(
-                {
-                    "location_hint": str(issue.get("location_hint") or ""),
-                    "category": str(issue.get("category") or ""),
-                    "before": excerpt[:160],
-                    "after": repaired_excerpt[:160],
-                }
-            )
 
-    repaired_text = clean_markdown_text(repaired_text)
-    if repaired_text == text:
-        return {
-            "status": "not_repaired",
-            "repaired": False,
-            "issue_count": len(targeted),
-            "summary": "本地规则未产生文本变化",
-        }
+
+def _apply_cleaning_rule(
+    rule_changes: list[dict[str, object]],
+    value: str,
+    *,
+    rule_id: str,
+    risk_level: str,
+    transform: Any,
+    match_count: int | None = None,
+    write_mode: str = "auto_apply",
+) -> str:
+    updated = str(transform(value))
+    if updated != value:
+        rule_changes.append(_rule_change(rule_id, value, updated, risk_level=risk_level, write_mode=write_mode, match_count=match_count))
+    return updated
+
+
+
+def _record_line_rule(
+    rule_changes: list[dict[str, object]],
+    *,
+    before: str,
+    after: str,
+    rule_id: str,
+    risk_level: str,
+    write_mode: str = "auto",
+) -> str:
+    if after != before:
+        rule_changes.append(_rule_change(rule_id, before, after, risk_level=risk_level, write_mode=write_mode))
+    return after
+
+
+
+def _rule_change(
+    rule_id: str,
+    before: str,
+    after: str,
+    *,
+    risk_level: str,
+    write_mode: str,
+    match_count: int | None = None,
+) -> dict[str, object]:
+    definition = rule_definition(rule_id)
+    normalized_write_mode = normalize_write_mode(write_mode or (definition.write_mode if definition else "auto_apply"))
+    normalized_risk_level = risk_level or (definition.risk_level if definition else "medium")
     return {
-        "status": "repaired",
-        "repaired": True,
-        "issue_count": len(targeted),
-        "changes": changes,
-        "repaired_text": repaired_text,
-        "summary": f"已按验收失败项执行 {len(targeted)} 个本地定点修复规则",
+        "rule_id": rule_id,
+        "description": definition.description if definition else "",
+        "risk_level": normalized_risk_level,
+        "write_mode": normalized_write_mode,
+        "match_count": max(1, int(match_count or 1)),
+        "input_sha256": _text_sha256(before),
+        "output_sha256": _text_sha256(after),
+        "examples": [{"before": _preview_change_text(before), "after": _preview_change_text(after)}],
     }
+
+
+
+def _preview_change_text(value: str, *, limit: int = 160) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    return compact[:limit]
+
+
+
+def _normalize_latex_unit_artifacts(text: str) -> str:
+    unit_names = r"g|mg|kg|ug|μg|ml|mL|L|mm|cm|m|min|s|h|kPa|mol|U"
+    cleaned = re.sub(
+        r"\$?\s*(?P<number>\d+(?:\.\d+)?)\s*(?:\^\s*\{\s*\\circ\s*\}|\^\s*\\circ|\\circ)\s*(?:\\mathrm\s*\{\s*C\s*\}|C)\s*\$?",
+        lambda match: f" {match.group('number')}℃",
+        text,
+    )
+    cleaned = re.sub(r"\$?\s*\\mathrm\s*\{\s*\}\s*\$?", " ", cleaned)
+    latex_symbols = {
+        "degreeC": "℃",
+        "degree": "°",
+        "circ": "°",
+        "times": "×",
+        "cdot": "·",
+        "pm": "±",
+        "mu": "μ",
+        "alpha": "α",
+        "beta": "β",
+        "gamma": "γ",
+        "delta": "δ",
+        "Delta": "Δ",
+        "sim": "~",
+        "rightarrow": "→",
+        "to": "→",
+        "leq": "≤",
+        "geq": "≥",
+    }
+    for command, replacement in latex_symbols.items():
+        cleaned = re.sub(rf"\\{command}(?![A-Za-z])", replacement, cleaned)
+    cleaned = cleaned.replace(r"\%", "%")
+    cleaned = re.sub(
+        rf"\$?\s*(?P<number>\d+(?:\.\d+)?)\s*\\mathrm\s*\{{\s*(?P<unit>{unit_names})\s*\}}\s*\$?",
+        lambda match: f" {match.group('number')}{match.group('unit')}",
+        cleaned,
+    )
+    cleaned = re.sub(
+        rf"\$?\s*\\mathrm\s*\{{\s*(?P<unit>{unit_names}|C)\s*\}}\s*\$?",
+        lambda match: match.group("unit"),
+        cleaned,
+    )
+    wrapper_commands = r"mathrm|mathbf|mathsf|text|operatorname|mathit|mathcal|mathbb"
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = re.sub(rf"\\(?:{wrapper_commands})\s*\{{\s*([^{{}}\n]{{1,160}})\s*\}}", r"\1", cleaned)
+    cleaned = re.sub(r"\^\s*\{\s*([^{}\n]{1,32})\s*\}", r"^\1", cleaned)
+    cleaned = re.sub(r"_\s*\{\s*([^{}\n]{1,32})\s*\}", r"_\1", cleaned)
+    cleaned = re.sub(r"\$\s*([^$\n]{1,120})\s*\$", r"\1", cleaned)
+    cleaned = cleaned.replace("$", "")
+    cleaned = re.sub(r"(?<=\d)\s*~\s*(?=\d)", "~", cleaned)
+    cleaned = re.sub(r"μ\s*mol\s*/\s*L", "μmol/L", cleaned)
+    cleaned = re.sub(r"\b([A-Za-z])\s*/\s*([A-Za-z])\s*=\s*", r"\1/\2=", cleaned)
+    cleaned = re.sub(r"([㐀-鿿]{2,8})\n\n(\d+~\d+)", r"\1\2", cleaned)
+    cleaned = re.sub(r"\$\s*([^$\n]{0,80}?(?:℃|\d+(?:\.\d+)?(?:g|mg|kg|ug|μg|ml|mL|L|mm|cm|m|min|s|h|kPa)))\s*\$", r"\1", cleaned)
+    cleaned = re.sub(r"\\([A-Za-z]+)\s*\{\s*([^{}\n]{1,160})\s*\}", r"\2", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+(?=\d+(?:\.\d+)?(?:g|mg|kg|ug|μg|ml|mL|L|mm|cm|m|min|s|h|kPa)\b)", " ", cleaned)
+    return cleaned
+
 
 
 def _acceptance_blocking_issues(acceptance: dict[str, Any]) -> list[dict[str, Any]]:
@@ -138,6 +235,7 @@ def _acceptance_blocking_issues(acceptance: dict[str, Any]) -> list[dict[str, An
     return issues
 
 
+
 def _transcribe_table_flowchart_details(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
         prefix = text[max(0, match.start() - 500) : match.start()]
@@ -153,11 +251,13 @@ def _transcribe_table_flowchart_details(text: str) -> str:
     return MINERU_FLOWCHART_DETAILS_RE.sub(replace, text)
 
 
+
 def _near_table_image(prefix: str) -> bool:
     tail = prefix[-500:]
     if re.search(r"!\[[^\]]*(?:表|table)[^\]]*\]\([^)]*\)\s*$", tail, flags=re.IGNORECASE):
         return True
     return bool(re.search(r"(?:^|\n)\s*(?:表|Table)\s*\d+", tail, flags=re.IGNORECASE))
+
 
 
 def _flowchart_rows(body: str) -> list[tuple[str, str]]:
@@ -182,6 +282,7 @@ def _flowchart_rows(body: str) -> list[tuple[str, str]]:
     return rows
 
 
+
 def _flowchart_node_label(raw_value: str) -> str:
     value = raw_value.strip().strip(";")
     value = re.sub(r"\s*[-.=]+.*$", "", value).strip()
@@ -193,14 +294,16 @@ def _flowchart_node_label(raw_value: str) -> str:
     return value.replace("|", "｜").strip()
 
 
+
 def _split_local_structure_glue(text: str, *, structure_labels: tuple[str, ...] | None = None) -> str:
     labels = structure_labels or DEFAULT_STRUCTURE_LABELS
     cleaned = text
     for label in labels:
         escaped = re.escape(label)
-        cleaned = re.sub(rf"(?<!^)(?<!\n)(?<=[\u3400-\u9fffA-Za-z0-9）)])({escaped})", r"\n\1", cleaned)
-    cleaned = re.sub(r"(?<=年版)(?=(?:[\u3400-\u9fff]{2,4})?《)", "\n", cleaned)
+        cleaned = re.sub(rf"(?<!^)(?<!\n)(?<=[㐀-鿿A-Za-z0-9）)])({escaped})", r"\n\1", cleaned)
+    cleaned = re.sub(r"(?<=年版)(?=(?:[㐀-鿿]{2,4})?《)", "\n", cleaned)
     return cleaned
+
 
 
 def _html_table_tags_to_markdown(text: str) -> str:
@@ -211,6 +314,7 @@ def _html_table_tags_to_markdown(text: str) -> str:
     cleaned = re.sub(r"</?tr[^>]*>", "\n", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?(?:td|th)[^>]*>", " | ", cleaned, flags=re.IGNORECASE)
     return cleaned
+
 
 
 def _normalize_markdown_tables(lines: list[str], *, table_headers: tuple[tuple[str, ...], ...] | None = None) -> list[str]:
@@ -248,12 +352,14 @@ def _normalize_markdown_tables(lines: list[str], *, table_headers: tuple[tuple[s
     return normalized
 
 
+
 def _next_nonblank(lines: list[str], start: int) -> str:
     for line in lines[start:]:
         stripped = line.strip()
         if stripped:
             return stripped
     return ""
+
 
 
 def _merge_table_continuation_rows(lines: list[str], *, known_headers: tuple[tuple[str, ...], ...] | None = None) -> list[str]:
@@ -285,9 +391,11 @@ def _merge_table_continuation_rows(lines: list[str], *, known_headers: tuple[tup
     return normalized
 
 
+
 def _is_table_row(line: str) -> bool:
     stripped = line.strip()
     return stripped.startswith("|") and stripped.count("|") >= 2
+
 
 
 def _is_table_separator(line: str) -> bool:
@@ -295,9 +403,11 @@ def _is_table_separator(line: str) -> bool:
     return bool(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", stripped))
 
 
+
 def _is_known_table_header(line: str, *, known_headers: tuple[tuple[str, ...], ...] | None = None) -> bool:
     headers = known_headers if known_headers is not None else DEFAULT_TABLE_HEADERS
     return tuple(_table_cells(line)) in headers
+
 
 
 def _has_embedded_table_header(cells: list[str], *, known_headers: tuple[tuple[str, ...], ...] | None = None) -> bool:
@@ -310,12 +420,15 @@ def _has_embedded_table_header(cells: list[str], *, known_headers: tuple[tuple[s
     return False
 
 
+
 def _table_cells(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
+
 def _format_table_row(cells: list[str]) -> str:
     return "| " + " | ".join(cells) + " |"
+
 
 
 def _trailing_empty_cell_count(cells: list[str]) -> int:
@@ -327,162 +440,16 @@ def _trailing_empty_cell_count(cells: list[str]) -> int:
     return count
 
 
+
 def _table_separator(header: str) -> str:
     cell_count = max(1, len(header.strip().strip("|").split("|")))
     return "|" + "|".join("---" for _ in range(cell_count)) + "|"
 
 
 
-def quality_hints(text: str) -> dict[str, Any]:
-    chinese_chars = len(re.findall(r"[\u3400-\u9fff]", text))
-    punctuation_count = sum(text.count(char) for char in "，。；：！？、")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    forced = forced_line_break_candidates(text, limit=8)
-    low_punctuation_lines = [
-        {
-            "line_number": index,
-            "length": len(line),
-            "punctuation_count": sum(line.count(char) for char in "，。；：！？、"),
-            "excerpt": line[:180],
-        }
-        for index, line in enumerate(text.splitlines(), start=1)
-        if len(line.strip()) >= 180 and sum(line.count(char) for char in "，。；：！？、") <= 2
-    ]
-    return {
-        "total_chars": len(text),
-        "chinese_chars": chinese_chars,
-        "line_count": len(lines),
-        "punctuation_count": punctuation_count,
-        "punctuation_density": round(punctuation_count / max(1, chinese_chars), 4),
-        "error_hints": {
-            error: QUALITY_ERROR_HINTS[error]
-            for error in _deterministic_quality_errors(text)
-            if error in QUALITY_ERROR_HINTS
-        },
-        "forced_line_break_candidate_count": len(forced_line_break_candidates(text)),
-        "forced_line_break_samples": forced,
-        "long_low_punctuation_line_count": len(low_punctuation_lines),
-        "long_low_punctuation_samples": low_punctuation_lines[:8],
-    }
-
-
-def quality_errors(text: str) -> list[str]:
-    errors: list[str] = []
-    if not text.strip():
-        return ["empty_text"]
-    readable_chars = len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", text))
-    if readable_chars < 20:
-        errors.append("low_readable_chars")
-    hints = quality_hints(text)
-    if hints["punctuation_density"] < 0.006 and hints["chinese_chars"] >= 1000:
-        errors.append("low_punctuation_density")
-    if hints["forced_line_break_candidate_count"] >= 80:
-        errors.append("forced_line_break_residue")
-    if BAD_CONTROL_RE.search(text):
-        errors.append("bad_control_characters")
-    errors.extend(error for error in _deterministic_quality_errors(text) if error not in errors)
-    return errors
-
-
-def finalize_standard_document(text: str) -> dict[str, object]:
-    before = clean_markdown_text(text)
-    without_repeated, removed_lines = _remove_repeated_running_lines(before)
-    finalized = clean_markdown_text(_normalize_heading_spacing(without_repeated))
-    changes: list[dict[str, object]] = []
-    if removed_lines:
-        changes.append({"kind": "removed_repeated_lines", "lines": removed_lines})
-    if finalized != before and not changes:
-        changes.append({"kind": "normalized_spacing"})
-    elif finalized != before and changes:
-        changes.append({"kind": "normalized_spacing"})
-    return {
-        "status": "finalized",
-        "finalized": finalized != before,
-        "input_sha256": _text_sha256(before),
-        "output_sha256": _text_sha256(finalized),
-        "changes": changes,
-        "text": finalized,
-    }
-
-
-def final_acceptance_report(text: str) -> dict[str, object]:
-    errors = quality_errors(text)
-    blocking = [error for error in errors if error in FINAL_BLOCKING_ERROR_CODES]
-    return {
-        "status": "passed" if not blocking else "needs_revision",
-        "accepted": not blocking,
-        "blocking_errors": blocking,
-        "warnings": [error for error in errors if error not in blocking],
-        "hints": quality_hints(text),
-    }
-
-
-def forced_line_break_candidates(text: str, *, limit: int | None = None, structure_labels: tuple[str, ...] | None = None) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    lines = text.splitlines()
-    for index in range(len(lines) - 1):
-        previous = lines[index].strip()
-        current = lines[index + 1].strip()
-        if _looks_like_forced_break(previous, current, structure_labels=structure_labels):
-            rows.append({"line_number": index + 1, "previous": previous[:120], "current": current[:120]})
-            if limit is not None and len(rows) >= limit:
-                break
-    return rows
-
-
-def safe_stem(value: str) -> str:
-    stem = re.sub(r"[\\/:*?\"<>|\s]+", "_", value).strip("._")
-    return stem or "document"
-
-
-def _deterministic_quality_errors(text: str) -> list[str]:
-    errors: list[str] = []
-    if any(pattern in text for pattern in MOJIBAKE_PATTERNS):
-        errors.append("mojibake")
-    if "�" in text:
-        errors.append("replacement_characters")
-    if ZERO_WIDTH_RE.search(text):
-        errors.append("zero_width_characters")
-    if re.search(r"[\u4e00-\u9fff] {2,}[\u4e00-\u9fff]", text):
-        errors.append("abnormal_cjk_spaces")
-    if _has_general_forced_line_break(text):
-        errors.append("forced_line_breaks")
-    if _has_repeated_short_lines(text):
-        errors.append("duplicate_repeated_lines")
-    return errors
-
-
-def _has_repeated_short_lines(text: str) -> bool:
-    counts: dict[str, int] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if 3 <= len(line) <= 40 and not line.startswith(("#", "|")):
-            counts[line] = counts.get(line, 0) + 1
-    return any(count >= 3 for count in counts.values())
-
-
-def _remove_repeated_running_lines(text: str) -> tuple[str, list[str]]:
-    lines = text.splitlines()
-    counts: dict[str, int] = {}
-    for raw_line in lines:
-        line = raw_line.strip()
-        if 3 <= len(line) <= 40 and not line.startswith(("#", "|", "-", "*")):
-            counts[line] = counts.get(line, 0) + 1
-    repeated = {line for line, count in counts.items() if count >= 2}
-    output = [raw_line for raw_line in lines if raw_line.strip() not in repeated]
-    return "\n".join(output) + ("\n" if output else ""), sorted(repeated)
-
-
-def _normalize_heading_spacing(text: str) -> str:
-    normalized = re.sub(r"(^|\n)(#{1,6}\s+[^\n]+)\n(?!\n)", r"\1\2\n\n", text)
-    normalized = re.sub(r"(?<!\n)\n(#{1,6}\s+[^\n]+)", r"\n\n\1", normalized)
-    return normalized
-
-
 def _text_sha256(text: str) -> str:
-    import hashlib
-
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 
 
 def _merge_soft_wrapped_lines(lines: list[str], *, structure_labels: tuple[str, ...] | None = None) -> list[str]:
@@ -496,6 +463,7 @@ def _merge_soft_wrapped_lines(lines: list[str], *, structure_labels: tuple[str, 
     return result
 
 
+
 def _looks_like_forced_break(previous: str, current: str, *, structure_labels: tuple[str, ...] | None = None) -> bool:
     labels = structure_labels or DEFAULT_STRUCTURE_LABELS
     if not previous or not current:
@@ -506,24 +474,12 @@ def _looks_like_forced_break(previous: str, current: str, *, structure_labels: t
         return False
     if re.match(r"^([一二三四五六七八九十]+、|\d+[.、])", current):
         return False
-    if previous.endswith(tuple("。！？：；”』】)）")):
-        return False
-    if len(previous) < 8 or len(current) < 8:
-        return False
-    return bool(re.search(r"[\u3400-\u9fff]$", previous) and re.search(r"^[\u3400-\u9fff]", current))
+    return _looks_like_general_paragraph_fragment(previous, current)
 
-
-def _has_general_forced_line_break(text: str) -> bool:
-    for match in FORCED_LINE_BREAK_RE.finditer(text):
-        previous = text[: match.start()].rsplit("\n", 1)[-1].strip()
-        current = text[match.end() :].split("\n", 1)[0].strip()
-        if _looks_like_general_paragraph_fragment(previous, current):
-            return True
-    return False
 
 
 def _looks_like_general_paragraph_fragment(previous: str, current: str) -> bool:
-    if len(previous) < 8 or len(current) < 8:
+    if len(previous) < 8:
         return False
     if previous.startswith(("#", "|")) or current.startswith(("#", "|")):
         return False
@@ -533,13 +489,22 @@ def _looks_like_general_paragraph_fragment(previous: str, current: str) -> bool:
         return False
     if _looks_like_cjk_numbered_list_line(previous) and _looks_like_cjk_numbered_list_line(current):
         return False
-    cjk_boundary = bool(re.search(r"[\u3400-\u9fff]$", previous) and re.search(r"^[\u3400-\u9fff]", current))
+    if len(current) < 8:
+        if (
+            len(previous) >= 18
+            and re.search(r"[㐀-鿿]$", previous)
+            and re.fullmatch(r"[㐀-鿿]{1,7}[，,。；;：:、]?", current)
+        ):
+            return True
+        return False
+    cjk_boundary = bool(re.search(r"[㐀-鿿]$", previous) and re.search(r"^[㐀-鿿]", current))
     comma_boundary = previous.endswith(("，", ",", "、"))
     if comma_boundary and _looks_like_short_cjk_verse_line(previous) and _looks_like_short_cjk_verse_line(current):
         return False
     if not cjk_boundary and not comma_boundary and len(previous) + len(current) < 80:
         return False
-    return bool(re.search(r"[\u3400-\u9fffA-Za-z0-9，,、]$", previous) and re.search(r"^[\u3400-\u9fffA-Za-z0-9]", current))
+    return bool(re.search(r"[㐀-鿿A-Za-z0-9，,、]$", previous) and re.search(r"^[㐀-鿿A-Za-z0-9]", current))
+
 
 
 def _looks_like_short_cjk_verse_line(value: str) -> bool:
@@ -547,7 +512,8 @@ def _looks_like_short_cjk_verse_line(value: str) -> bool:
         return False
     if re.search(r"[A-Za-z0-9]", value):
         return False
-    return bool(re.fullmatch(r"[\u3400-\u9fff，、。！？；：”“‘’（）《》〈〉·]+", value))
+    return bool(re.fullmatch(r"[㐀-鿿，、。！？；：”“‘’（）《》〈〉·]+", value))
+
 
 
 def _looks_like_cjk_numbered_list_line(value: str) -> bool:

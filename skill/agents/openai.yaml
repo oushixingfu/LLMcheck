@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLMcheck"
+  short_description: "Convert documents to gate-checked Markdown"
+  default_prompt: "Use $llmcheck to convert the given documents into passed final Markdown only. Prefer llmcheck agent convert/status/get-md/profiles. Never use process/drafts as delivery."

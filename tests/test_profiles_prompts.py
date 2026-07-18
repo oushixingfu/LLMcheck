@@ -8,8 +8,10 @@ from llmcheck.llm import (
     build_acceptance_prompt,
     build_correction_prompt,
     build_repair_prompt,
+    build_review_prompt,
     correction_result_payload,
     repair_result_payload,
+    review_result_payload,
 )
 from llmcheck.profiles import DEFAULT_PROFILE_ID, get_profile, list_profiles
 
@@ -90,6 +92,57 @@ def test_repair_prompt_accepts_profile_and_preserves_chinese_medicine_rules() ->
     assert "中医参考资料" in prompt
     assert "不得凭中医知识补写" in prompt
     assert "profile_id: chinese_medicine_reference" in prompt
+
+
+def test_review_prompt_returns_issues_only_contract() -> None:
+    prompt = build_review_prompt(source_name="book.md", text_path=Path("book.md"), text="# 标题\n\n瓜蒌 $9\\mathrm{g}$。")
+
+    assert "人类视角审查员" in prompt
+    assert "只输出 issues" in prompt
+    assert "不得输出 corrected_text" in prompt
+    assert "repaired_text" in prompt
+    assert "全文改写" in prompt
+    assert "safe_fix_type" in prompt
+    assert "rule_fix|safe_llm_patch|manual_review|none" in prompt
+    assert '"issues"' in prompt
+    assert '"manual_review_notes"' in prompt
+
+
+def test_review_result_payload_normalizes_issue_lists_and_blocks_major_issues() -> None:
+    client = CapturingClient(
+        {
+            "status": "reviewed",
+            "accepted": True,
+            "summary": "发现明显残留",
+            "issues": [
+                {
+                    "id": "issue-001",
+                    "category": "latex_artifact",
+                    "severity": "major",
+                    "location_hint": "正文",
+                    "excerpt": "$9\\mathrm{g}$",
+                    "reason": "单位公式残留",
+                    "suggested_action": "规则清理",
+                    "safe_fix_type": "rule_fix",
+                }
+            ],
+            "manual_review_notes": "not-a-list",
+        }
+    )
+
+    result = review_result_payload(
+        source_name="book.md",
+        text_path=Path("book.md"),
+        text="瓜蒌 $9\\mathrm{g}$。",
+        client=client,
+        model="test-model",
+    )
+
+    assert result["status"] == "reviewed"
+    assert result["accepted"] is False
+    assert result["manual_review_notes"] == []
+    assert result["issues"][0]["category"] == "latex_artifact"
+    assert '"corrected_text"' not in client.prompts[0]
 
 
 def test_result_payloads_include_profile_id_and_pass_profile_to_prompt() -> None:

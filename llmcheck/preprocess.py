@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable
+import hashlib
 import http.client
 import json
+import os
 import re
 import socket
 import shutil
@@ -18,12 +20,14 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-from llmcheck.quality import safe_stem
+from llmcheck.cleaning import safe_stem
+from llmcheck.cross import write_cross_artifacts
 
 
 MARKDOWN_SUFFIXES = {".md"}
 PDF_SUFFIXES = {".pdf"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp"}
+WORD_SUFFIXES = {".doc", ".docx"}
 OFFICE_SUFFIXES = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 SUPPORTED_SUFFIXES = MARKDOWN_SUFFIXES | PDF_SUFFIXES | IMAGE_SUFFIXES | OFFICE_SUFFIXES
 DEFAULT_MINERU_BASE_URL = "https://mineru.net"
@@ -42,6 +46,7 @@ TRANSIENT_NETWORK_ERRORS = (TimeoutError, urllib.error.URLError, socket.timeout)
 class SourceKind(StrEnum):
     MARKDOWN = "markdown"
     PDF = "pdf"
+    WORD = "word"
     MINERU_ONLY = "mineru_only"
 
 
@@ -67,6 +72,7 @@ class PreprocessSettings:
     mineru_request_timeout_seconds: int = DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS
     mineru_max_retries: int = DEFAULT_MINERU_MAX_RETRIES
     mineru_retry_backoff_seconds: float = DEFAULT_MINERU_RETRY_BACKOFF_SECONDS
+    mineru_fallback: str = "ppx"
     pdf_page_chunk_size: int = DEFAULT_PDF_PAGE_CHUNK_SIZE
     ppx_command: str = DEFAULT_PPX_COMMAND
     ppx_cwd: str = DEFAULT_PPX_CWD
@@ -116,10 +122,11 @@ def prepare_markdown_inputs(
     markdowns: list[Path] = []
     preprocess_root = output_dir / "preprocess"
     for source in sources:
-        if source.kind == SourceKind.MARKDOWN:
-            markdowns.append(source.path)
-            continue
         work_dir = preprocess_root / safe_stem(source.path.stem)
+        if source.kind == SourceKind.MARKDOWN:
+            formal_path = _write_existing_markdown_manifest(path=source.path, work_dir=work_dir)
+            markdowns.append(formal_path)
+            continue
         if source.kind == SourceKind.PDF:
             markdowns.append(
                 _prepare_pdf_markdown(
@@ -133,11 +140,24 @@ def prepare_markdown_inputs(
                 )
             )
             continue
+        if source.kind == SourceKind.WORD:
+            markdowns.append(
+                _prepare_word_markdown(
+                    source.path,
+                    work_dir=work_dir,
+                    settings=settings,
+                    page_count_reader=page_count_reader or pdf_page_count,
+                    ppx_runner=ppx_runner or run_ppx,
+                    mineru_runner=mineru_runner or run_mineru_vlm,
+                )
+            )
+            continue
         markdowns.append(
             _prepare_mineru_only_markdown(
                 source.path,
                 work_dir=work_dir,
                 settings=settings,
+                ppx_runner=ppx_runner or run_ppx,
                 mineru_runner=mineru_runner or run_mineru_vlm,
             )
         )
@@ -152,11 +172,17 @@ def page_segments(page_count: int, *, max_pages: int = 200) -> list[tuple[int, i
 
 
 def pdf_page_count(path: Path) -> int:
-    completed = subprocess.run(["pdfinfo", str(path)], text=True, capture_output=True, check=False, timeout=15)
+    try:
+        completed = subprocess.run(["pdfinfo", str(path)], text=True, capture_output=True, check=False, timeout=15)
+    except FileNotFoundError:
+        return _pdf_page_count_with_pypdf(path)
     match = re.search(r"^Pages:\s+(\d+)", completed.stdout, re.MULTILINE)
-    if not match:
-        raise RuntimeError(f"无法读取 PDF 页数：{path}\n{completed.stderr[-500:]}")
-    return int(match.group(1))
+    if match:
+        return int(match.group(1))
+    try:
+        return _pdf_page_count_with_pypdf(path)
+    except Exception as error:
+        raise RuntimeError(f"无法读取 PDF 页数：{path}\n{completed.stderr[-500:]}") from error
 
 
 def split_pdf_for_mineru(path: Path, *, output_dir: Path, max_pages: int = DEFAULT_PDF_PAGE_CHUNK_SIZE) -> list[Path]:
@@ -166,16 +192,39 @@ def split_pdf_for_mineru(path: Path, *, output_dir: Path, max_pages: int = DEFAU
     output_dir.mkdir(parents=True, exist_ok=True)
     segments: list[Path] = []
     for index, (start, end) in enumerate(page_segments(page_count, max_pages=max_pages), start=1):
-        segment_path = output_dir / f"{safe_stem(path.stem)}__pages_{start:04d}_{end:04d}.pdf"
+        segment_path = output_dir / f"segment_{start:04d}_{end:04d}.pdf"
         if not segment_path.exists():
-            subprocess.run(
-                ["qpdf", "--empty", "--pages", str(path), f"{start}-{end}", "--", str(segment_path)],
-                text=True,
-                capture_output=True,
-                check=True,
-            )
+            _write_pdf_segment(source_path=path, start=start, end=end, segment_path=segment_path)
         segments.append(segment_path)
     return segments
+
+
+def _pdf_page_count_with_pypdf(path: Path) -> int:
+    from pypdf import PdfReader
+
+    return len(PdfReader(str(path)).pages)
+
+
+def _write_pdf_segment(*, source_path: Path, start: int, end: int, segment_path: Path) -> None:
+    segment_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["qpdf", "--empty", "--pages", str(source_path), f"{start}-{end}", "--", str(segment_path)],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return
+    except FileNotFoundError:
+        pass
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(source_path))
+    writer = PdfWriter()
+    for page_index in range(start - 1, min(end, len(reader.pages))):
+        writer.add_page(reader.pages[page_index])
+    with segment_path.open("wb") as handle:
+        writer.write(handle)
 
 
 def run_ppx(path: Path, *, output_dir: Path, settings: PreprocessSettings) -> Path:
@@ -245,6 +294,7 @@ def run_mineru_vlm_for_pdf_chunks(
     settings: PreprocessSettings,
 ) -> Path:
     segments = page_segments(page_count, max_pages=settings.pdf_page_chunk_size)
+    # Prefer source-stem naming for stable cache keys; fall back to generic segment_* names.
     segment_paths = [segment_dir / f"{safe_stem(path.stem)}__pages_{start:04d}_{end:04d}.pdf" for start, end in segments]
     cached = _cached_mineru_markdown(segment_paths, output_dir=output_dir)
     if cached is not None:
@@ -274,6 +324,36 @@ def run_mineru_vlm_for_pdf_chunks(
         client=_mineru_client(settings),
     )
     return _write_mineru_result(files=segment_paths, ordered_results=ordered_results, output_dir=output_dir, settings=settings)
+
+
+def _write_existing_markdown_manifest(*, path: Path, work_dir: Path) -> Path:
+    formal_path, cross_report = _finalize_cross_selection(
+        work_dir,
+        mineru_path=None,
+        ppx_path=None,
+        existing_md_path=path,
+    )
+    path_hash = _sha256_file(path)
+    formal_hash = _sha256_file(formal_path) if formal_path.exists() else path_hash
+    manifest = {
+        "source": str(path),
+        "kind": SourceKind.MARKDOWN.value,
+        "formal_markdown": str(formal_path),
+        "cross_report": str(work_dir / "cross" / "cross_report.json"),
+        "acquisition_mode": str(cross_report.get("mode") or "existing_md"),
+        "source_sha256": path_hash,
+        "formal_markdown_sha256": formal_hash,
+    }
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "preprocess_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return formal_path
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _mineru_client(settings: PreprocessSettings) -> MinerUClient:
@@ -474,7 +554,43 @@ def _prepare_pdf_markdown(
             mineru_runner=mineru_runner,
         )
         if cached_mineru is None:
-            raise RuntimeError("PDF 标准流程需要配置 MinerU API key；PPX 仅作为审计/修复参考，不能替代 MinerU 正文")
+            if not _ppx_fallback_enabled(settings):
+                raise RuntimeError("missing MinerU API key and PPX fallback is disabled")
+            ppx_path = _run_ppx_audit_foreground(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
+            formal_path, cross_report = _finalize_cross_selection(
+                work_dir,
+                mineru_path=None,
+                ppx_path=ppx_path,
+            )
+            _write_pdf_preprocess_manifest(
+                path=path,
+                work_dir=work_dir,
+                page_count=page_count,
+                ppx_path=ppx_path,
+                mineru_path=None,
+                formal_path=formal_path,
+                settings=settings,
+                acquisition_mode=str(cross_report.get("mode") or "ppx_fallback"),
+                mineru_error="missing MinerU API key",
+            )
+            return formal_path
+        ppx_path = work_dir / "ppx" / "clean" / "ppx.md"
+        formal_path, cross_report = _finalize_cross_selection(
+            work_dir,
+            mineru_path=cached_mineru,
+            ppx_path=ppx_path if ppx_path.exists() else None,
+        )
+        _write_pdf_preprocess_manifest(
+            path=path,
+            work_dir=work_dir,
+            page_count=page_count,
+            ppx_path=ppx_path,
+            mineru_path=cached_mineru,
+            formal_path=formal_path,
+            settings=settings,
+            acquisition_mode=str(cross_report.get("mode") or "mineru_only"),
+        )
+        return formal_path
     ppx_path = _start_ppx_audit_background(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
     with ThreadPoolExecutor(max_workers=1) as executor:
         if page_count > settings.pdf_page_chunk_size:
@@ -494,17 +610,47 @@ def _prepare_pdf_markdown(
         else:
             segment_paths = [path]
             mineru_future = executor.submit(mineru_runner, segment_paths, output_dir=work_dir / "mineru", settings=settings)
-        mineru_path = mineru_future.result()
+        try:
+            mineru_path = mineru_future.result()
+        except Exception as error:
+            if not _ppx_fallback_enabled(settings):
+                raise
+            ppx_path = _run_ppx_audit_foreground(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
+            formal_path, cross_report = _finalize_cross_selection(
+                work_dir,
+                mineru_path=None,
+                ppx_path=ppx_path,
+            )
+            _write_pdf_preprocess_manifest(
+                path=path,
+                work_dir=work_dir,
+                page_count=page_count,
+                ppx_path=ppx_path,
+                mineru_path=None,
+                formal_path=formal_path,
+                settings=settings,
+                acquisition_mode=str(cross_report.get("mode") or "ppx_fallback"),
+                mineru_error=str(error),
+            )
+            return formal_path
+    # Pass the expected PPX path even if the background audit is still running;
+    # missing/empty PPX is scored as an unusable dual candidate (selected_mineru).
+    formal_path, cross_report = _finalize_cross_selection(
+        work_dir,
+        mineru_path=mineru_path,
+        ppx_path=_resolve_ppx_candidate(work_dir, preferred=ppx_path) or ppx_path,
+    )
     _write_pdf_preprocess_manifest(
         path=path,
         work_dir=work_dir,
         page_count=page_count,
         ppx_path=ppx_path,
         mineru_path=mineru_path,
-        formal_path=mineru_path,
+        formal_path=formal_path,
         settings=settings,
+        acquisition_mode=str(cross_report.get("mode") or "selected_mineru"),
     )
-    return mineru_path
+    return formal_path
 
 
 def _cached_pdf_mineru_markdown(
@@ -537,6 +683,8 @@ def _write_pdf_preprocess_manifest(
     mineru_path: Path | None,
     formal_path: Path,
     settings: PreprocessSettings,
+    acquisition_mode: str,
+    mineru_error: str = "",
 ) -> None:
     manifest = {
         "source": str(path),
@@ -546,6 +694,9 @@ def _write_pdf_preprocess_manifest(
         "ppx_audit_status": str(work_dir / "ppx" / "ppx_audit_status.json"),
         "mineru_markdown": str(mineru_path) if mineru_path is not None else "",
         "formal_markdown": str(formal_path),
+        "cross_report": str(work_dir / "cross" / "cross_report.json"),
+        "acquisition_mode": acquisition_mode,
+        "mineru_error": mineru_error,
         "mineru_model": settings.mineru_model,
     }
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -590,7 +741,7 @@ def _start_ppx_audit_background(
         return expected_path
 
     def run_audit() -> None:
-        _write_ppx_audit_status(status_path, source=path, status="running", ppx_markdown=expected_path)
+        _write_ppx_audit_status(status_path, source=path, status="running", ppx_markdown=expected_path, thread_name=threading.current_thread().name)
         try:
             actual_path = ppx_runner(path, output_dir=ppx_dir, settings=settings)
         except Exception as error:  # noqa: BLE001 - PPX is an audit path; formal text can proceed from MinerU.
@@ -598,12 +749,24 @@ def _start_ppx_audit_background(
             return
         _write_ppx_audit_status(status_path, source=path, status="completed", ppx_markdown=actual_path)
 
-    thread = threading.Thread(target=run_audit, name=f"llmcheck-ppx-audit-{safe_stem(path.stem)}")
+    thread = threading.Thread(target=run_audit, name=f"llmcheck-ppx-audit-{safe_stem(path.stem)}", daemon=True)
     thread.start()
     return expected_path
 
 
-def _write_ppx_audit_status(path: Path, *, source: Path, status: str, ppx_markdown: Path, error: str = "") -> None:
+def _ppx_fallback_enabled(settings: PreprocessSettings) -> bool:
+    return str(getattr(settings, "mineru_fallback", "ppx") or "ppx").strip().lower() == "ppx"
+
+
+def _write_ppx_audit_status(
+    path: Path,
+    *,
+    source: Path,
+    status: str,
+    ppx_markdown: Path,
+    error: str = "",
+    thread_name: str = "",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
@@ -612,6 +775,9 @@ def _write_ppx_audit_status(path: Path, *, source: Path, status: str, ppx_markdo
                 "status": status,
                 "ppx_markdown": str(ppx_markdown),
                 "error": error,
+                "pid": os.getpid(),
+                "thread_name": thread_name,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
             ensure_ascii=False,
             indent=2,
@@ -619,7 +785,6 @@ def _write_ppx_audit_status(path: Path, *, source: Path, status: str, ppx_markdo
         + "\n",
         encoding="utf-8",
     )
-
 
 def _write_mineru_segment_status(path: Path, **payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -644,14 +809,15 @@ def _resumable_mineru_batch_id(status_path: Path, *, file_path: Path) -> str:
     if str(status.get("source") or "") != str(file_path):
         return ""
     batch_id = str(status.get("batch_id") or "")
+    status_value = str(status.get("status") or "").lower()
     recovered_from_timeout_error = False
     if not batch_id:
-        match = re.search(r"MinerU batch ([0-9a-fA-F-]{36}) 超时", str(status.get("error") or ""))
+        error_text = str(status.get("error") or "")
+        match = re.search(r"MinerU batch ([0-9a-fA-F-]{36})", error_text)
         batch_id = match.group(1) if match else ""
-        recovered_from_timeout_error = bool(batch_id)
+        recovered_from_timeout_error = bool(batch_id and ("超时" in error_text or "timeout" in error_text.lower() or status_value == "failed"))
     if not batch_id:
         return ""
-    status_value = str(status.get("status") or "").lower()
     previous_status = str(status.get("previous_status") or "").lower()
     if status_value in {"polling", "downloading"}:
         return batch_id
@@ -675,17 +841,37 @@ def _prepare_mineru_only_markdown(
     *,
     work_dir: Path,
     settings: PreprocessSettings,
+    ppx_runner: Callable[..., Path],
     mineru_runner: Callable[..., Path],
 ) -> Path:
-    mineru_path = mineru_runner([path], output_dir=work_dir / "mineru", settings=settings)
+    mineru_error = ""
+    ppx_path: Path | None = None
+    try:
+        mineru_path = mineru_runner([path], output_dir=work_dir / "mineru", settings=settings)
+    except Exception as error:
+        if not _ppx_fallback_enabled(settings):
+            raise
+        mineru_path = None
+        mineru_error = str(error)
+        ppx_path = _run_ppx_audit_foreground(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
+    formal_path, cross_report = _finalize_cross_selection(
+        work_dir,
+        mineru_path=mineru_path,
+        ppx_path=ppx_path,
+    )
+    acquisition_mode = str(cross_report.get("mode") or ("ppx_fallback" if mineru_path is None else "mineru_only"))
     work_dir.mkdir(parents=True, exist_ok=True)
     (work_dir / "preprocess_manifest.json").write_text(
         json.dumps(
             {
                 "source": str(path),
                 "kind": SourceKind.MINERU_ONLY.value,
-                "mineru_markdown": str(mineru_path),
-                "formal_markdown": str(mineru_path),
+                "mineru_markdown": str(mineru_path) if mineru_path is not None else "",
+                "ppx_markdown": str(ppx_path) if ppx_path is not None else "",
+                "formal_markdown": str(formal_path),
+                "cross_report": str(work_dir / "cross" / "cross_report.json"),
+                "acquisition_mode": acquisition_mode,
+                "mineru_error": mineru_error,
                 "mineru_model": settings.mineru_model,
             },
             ensure_ascii=False,
@@ -694,7 +880,161 @@ def _prepare_mineru_only_markdown(
         + "\n",
         encoding="utf-8",
     )
-    return mineru_path
+    return formal_path
+
+
+def _prepare_word_markdown(
+    path: Path,
+    *,
+    work_dir: Path,
+    settings: PreprocessSettings,
+    page_count_reader: PdfPageCounter,
+    ppx_runner: Callable[..., Path],
+    mineru_runner: Callable[..., Path],
+) -> Path:
+    # Preferred path: Word → PDF → MinerU page chunks.
+    # If conversion/page-count is unavailable, fall back to whole-file MinerU.
+    mineru_error = ""
+    ppx_path: Path | None = None
+    converted_pdf: Path | None = None
+    mineru_path: Path | None = None
+    try:
+        converted_pdf = _convert_word_to_pdf(path, output_dir=work_dir / "converted_pdf")
+        page_count = page_count_reader(converted_pdf)
+        if page_count > settings.pdf_page_chunk_size:
+            mineru_path = run_mineru_vlm_for_pdf_chunks(
+                converted_pdf,
+                page_count=page_count,
+                segment_dir=work_dir / "mineru_segments",
+                output_dir=work_dir / "mineru",
+                settings=settings,
+            )
+        else:
+            mineru_path = mineru_runner([converted_pdf], output_dir=work_dir / "mineru", settings=settings)
+    except Exception as conversion_error:
+        converted_pdf = None
+        try:
+            mineru_path = mineru_runner([path], output_dir=work_dir / "mineru", settings=settings)
+            mineru_error = ""
+        except Exception as mineru_error_exc:
+            if not _ppx_fallback_enabled(settings):
+                raise
+            mineru_path = None
+            mineru_error = f"{conversion_error}; {mineru_error_exc}"
+            ppx_path = _run_ppx_audit_foreground(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
+    formal_path, cross_report = _finalize_cross_selection(
+        work_dir,
+        mineru_path=mineru_path,
+        ppx_path=ppx_path,
+    )
+    acquisition_mode = str(cross_report.get("mode") or ("ppx_fallback" if mineru_path is None else "mineru_only"))
+    work_dir.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, Any] = {
+        "source": str(path),
+        "kind": SourceKind.WORD.value,
+        "mineru_markdown": str(mineru_path) if mineru_path is not None else "",
+        "ppx_markdown": str(ppx_path) if ppx_path is not None else "",
+        "formal_markdown": str(formal_path),
+        "cross_report": str(work_dir / "cross" / "cross_report.json"),
+        "acquisition_mode": acquisition_mode,
+        "mineru_error": mineru_error,
+        "mineru_model": settings.mineru_model,
+    }
+    if converted_pdf is not None:
+        manifest["converted_pdf"] = str(converted_pdf)
+    (work_dir / "preprocess_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return formal_path
+
+
+def _finalize_cross_selection(
+    work_dir: Path,
+    *,
+    mineru_path: Path | None,
+    ppx_path: Path | None,
+    existing_md_path: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    initial_path = write_cross_artifacts(
+        work_dir,
+        mineru_path=mineru_path,
+        ppx_path=ppx_path,
+        existing_md_path=existing_md_path,
+    )
+    report_path = work_dir / "cross" / "cross_report.json"
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    return initial_path, payload if isinstance(payload, dict) else {}
+
+
+def _resolve_ppx_candidate(work_dir: Path, *, preferred: Path | None = None) -> Path | None:
+    candidates: list[Path] = []
+    if preferred is not None:
+        candidates.append(preferred)
+    candidates.append(work_dir / "ppx" / "clean" / "ppx.md")
+    status_path = work_dir / "ppx" / "ppx_audit_status.json"
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            status = {}
+        if isinstance(status, dict):
+            status_md = str(status.get("ppx_markdown") or "").strip()
+            if status_md:
+                candidates.append(Path(status_md))
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+    return preferred if preferred is not None else None
+
+
+def _convert_word_to_pdf(path: Path, *, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    expected_path = output_dir / f"{safe_stem(path.stem)}.pdf"
+    if expected_path.exists() and expected_path.stat().st_size > 0:
+        return expected_path
+    command = shutil.which("soffice") or shutil.which("libreoffice")
+    if not command:
+        raise RuntimeError("LibreOffice/soffice 命令不存在，无法将 Word 文档转为 PDF")
+    existing = {candidate.resolve() for candidate in output_dir.glob("*.pdf")}
+    completed = subprocess.run(
+        [
+            command,
+            "--headless",
+            "--invisible",
+            "--nodefault",
+            "--norestore",
+            "--nolockcheck",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(output_dir),
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=3600,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "LibreOffice Word 转 PDF 失败")[-2000:])
+    if expected_path.exists() and expected_path.stat().st_size > 0:
+        return expected_path
+    new_pdfs = [
+        candidate
+        for candidate in output_dir.glob("*.pdf")
+        if candidate.resolve() not in existing and candidate.stat().st_size > 0
+    ]
+    if len(new_pdfs) == 1:
+        new_pdfs[0].replace(expected_path)
+        return expected_path
+    raise RuntimeError(f"LibreOffice 未生成预期 PDF：{expected_path}")
 
 
 def _source_file(path: Path) -> SourceFile | None:
@@ -703,6 +1043,8 @@ def _source_file(path: Path) -> SourceFile | None:
         return SourceFile(path=path, kind=SourceKind.MARKDOWN)
     if suffix in PDF_SUFFIXES:
         return SourceFile(path=path, kind=SourceKind.PDF)
+    if suffix in WORD_SUFFIXES:
+        return SourceFile(path=path, kind=SourceKind.WORD)
     if suffix in IMAGE_SUFFIXES or suffix in OFFICE_SUFFIXES:
         return SourceFile(path=path, kind=SourceKind.MINERU_ONLY)
     return None
@@ -1216,13 +1558,7 @@ def _run_one_mineru_pdf_segment(
 
 def _ensure_pdf_segment(*, source_path: Path, start: int, end: int, segment_path: Path) -> Path:
     if not segment_path.exists():
-        segment_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["qpdf", "--empty", "--pages", str(source_path), f"{start}-{end}", "--", str(segment_path)],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
+        _write_pdf_segment(source_path=source_path, start=start, end=end, segment_path=segment_path)
     return segment_path
 
 

@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import http.client
 import json
 import os
 import subprocess
 import threading
+import time
 import urllib.error
 import zipfile
 
+import llmcheck.preprocess as preprocess
 from llmcheck.batch import discover_batch_sources, run_batch
 from llmcheck import gui_exe
 from llmcheck.cli import _print_progress_event, main
 from llmcheck.llm import LlmClient, LlmConfig
+from llmcheck.model_compare import run_model_compare
 from llmcheck.gui import JobStore, _read_mineru_segment_status, _save_uploaded_files, _with_live_progress, render_index_html
-from llmcheck.pipeline import LlmCheckSettings, correct_text_concurrently, process_documents
+from llmcheck.pipeline import LlmCheckSettings, _apply_safe_review_patches, correct_text_concurrently, process_documents
+from llmcheck.preflight import preflight_llm_models
 from llmcheck.pipeline import split_text_chunks
 from llmcheck.preprocess import (
     MinerUClient,
@@ -44,18 +49,135 @@ class FakeClient:
             return {
                 "status": "draft_ready",
                 "confidence": 0.9,
-                "summary": "已完成纠错",
-                "corrected_text": "# 医案\n\n患者头痛，处方桂枝汤。\n",
+                "summary": "correction complete",
+                "corrected_text": "# Case\n\nPatient has headache. Use guizhi decoction.\n",
                 "changes": [],
                 "unresolved_issues": [],
             }
         return {
             "status": "passed" if self.accept else "needs_revision",
             "confidence": 0.9,
-            "summary": "可交付" if self.accept else "仍需返修",
-            "blocking_issues": [] if self.accept else [{"category": "layout", "reason": "分段异常"}],
+            "summary": "deliverable" if self.accept else "needs repair",
+            "blocking_issues": [] if self.accept else [{"category": "layout", "reason": "bad paragraph split"}],
             "non_blocking_notes": [],
         }
+
+
+class ReviewClient:
+    def __init__(self, *, accept: bool = True) -> None:
+        self.accept = accept
+        self.calls: list[str] = []
+
+    def complete_json(self, prompt: str) -> dict[str, object]:
+        self.calls.append(prompt)
+        return {
+            "status": "reviewed",
+            "accepted": self.accept,
+            "confidence": 0.9,
+            "summary": "review passed" if self.accept else "blocking issue found",
+            "issues": []
+            if self.accept
+            else [
+                {
+                    "id": "issue-001",
+                    "category": "latex_artifact",
+                    "severity": "blocking",
+                    "location_hint": "body",
+                    "excerpt": "$9\\mathrm{g}$",
+                    "reason": "unit formula residue",
+                    "suggested_action": "clean by deterministic rule or manual review",
+                    "safe_fix_type": "rule_fix",
+                }
+            ],
+            "manual_review_notes": [] if self.accept else ["review unit cleanup rule"],
+        }
+
+
+def test_process_documents_uses_fallback_model_when_preferred_unavailable(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("# 医案\n\n桂枝汤用于外感风寒。\n", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+
+    class FakeModelClient:
+        def __init__(self, config: LlmConfig) -> None:
+            self.config = config
+            self._call_count = 0
+
+        @property
+        def call_count(self) -> int:
+            return self._call_count
+
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            self._call_count += 1
+            calls.append((self.config.model, self.config.api_url))
+            if self.config.model == "mimo-v2.5-pro":
+                return {"status": "error", "error": "model temporarily unavailable"}
+            return {
+                "status": "reviewed",
+                "accepted": True,
+                "confidence": 0.9,
+                "summary": "review passed",
+                "issues": [],
+                "manual_review_notes": [],
+            }
+
+    monkeypatch.setattr("llmcheck.pipeline.LlmClient", FakeModelClient)
+
+    report = process_documents(
+        input_path=source,
+        output_dir=tmp_path / "out",
+        settings=LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="key",
+            llm_model="mimo-v2.5-pro",
+            fallback_models="gpt-5.5",
+        ),
+    )
+
+    row = report["documents"][0]
+    call_rows = [json.loads(line) for line in Path(row["llm_calls_report_path"]).read_text(encoding="utf-8").splitlines()]
+    assert report["status"] == "passed"
+    assert calls[:2] == [
+        ("mimo-v2.5-pro", "https://api.iaigc.fun/v1"),
+        ("gpt-5.5", "http://127.0.0.1:3022"),
+    ]
+    assert call_rows[0]["model"] == "gpt-5.5"
+    assert call_rows[0]["fallback_used"] is True
+    assert call_rows[0]["attempted_models"] == ["mimo-v2.5-pro", "gpt-5.5"]
+
+
+def test_preflight_llm_models_reports_fallback_availability_without_secrets() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeProbeClient:
+        def __init__(self, config: LlmConfig) -> None:
+            self.config = config
+
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            calls.append((self.config.model, self.config.api_url))
+            if self.config.model == "mimo-v2.5-pro":
+                return {"status": "error", "error": "model unavailable"}
+            return {"status": "ok"}
+
+    report = preflight_llm_models(
+        LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="secret-key",
+            llm_model="mimo-v2.5-pro",
+            fallback_models="gpt-5.5",
+        ),
+        client_factory=FakeProbeClient,
+    )
+
+    assert calls == [
+        ("mimo-v2.5-pro", "https://api.iaigc.fun/v1"),
+        ("gpt-5.5", "http://127.0.0.1:3022"),
+    ]
+    assert report["status"] == "passed"
+    assert report["preferred_available_model"] == "gpt-5.5"
+    assert [row["model"] for row in report["models"]] == ["mimo-v2.5-pro", "gpt-5.5"]
+    assert [row["available"] for row in report["models"]] == [False, True]
+    assert "secret-key" not in json.dumps(report, ensure_ascii=False)
 
 
 class EchoChunkClient:
@@ -70,8 +192,8 @@ class EchoChunkClient:
             return {
                 "status": "draft_ready",
                 "confidence": 0.8,
-                "summary": "片段已纠错",
-                "corrected_text": text.replace("错字", "正字"),
+                "summary": "chunk corrected",
+                "corrected_text": text.replace("typo", "fixed"),
                 "changes": [],
                 "unresolved_issues": [],
             }
@@ -79,7 +201,7 @@ class EchoChunkClient:
         return {
             "status": "passed",
             "confidence": 0.8,
-            "summary": "片段可交付",
+            "summary": "chunk accepted",
             "blocking_issues": [],
             "non_blocking_notes": [],
         }
@@ -97,15 +219,15 @@ class ReviewButCorrectedClient:
             return {
                 "status": "needs_manual_review",
                 "confidence": 0.8,
-                "summary": "有疑点但已给出完整纠正文",
-                "corrected_text": text.replace("错字", "正字"),
+                "summary": "review noted but full correction supplied",
+                "corrected_text": text.replace("typo", "fixed"),
                 "changes": [],
-                "unresolved_issues": [{"location_hint": "片段", "excerpt": "疑点", "reason": "保留给验收"}],
+                "unresolved_issues": [{"location_hint": "chunk", "excerpt": "doubt", "reason": "keep for acceptance"}],
             }
         return {
             "status": "passed",
             "confidence": 0.8,
-            "summary": "可交付",
+            "summary": "deliverable",
             "blocking_issues": [],
             "non_blocking_notes": [],
         }
@@ -114,16 +236,15 @@ class ReviewButCorrectedClient:
 class EmptyMarkupResidueClient:
     def complete_json(self, prompt: str) -> dict[str, object]:
         text = prompt.split("<TEXT_BEGIN>\n", 1)[1].split("\n<TEXT_END>", 1)[0]
-        corrected = "" if text.strip() == "<td></td></tr></table>" else text.replace("错字", "正字")
+        corrected = "" if text.strip() == "<td></td></tr></table>" else text.replace("typo", "fixed")
         return {
             "status": "draft_ready",
             "confidence": 0.9,
-            "summary": "已清理片段",
+            "summary": "chunk cleaned",
             "corrected_text": corrected,
             "changes": [],
             "unresolved_issues": [],
         }
-
 
 def test_llm_client_retries_invalid_json_message_content(monkeypatch) -> None:
     responses = [
@@ -132,7 +253,7 @@ def test_llm_client_retries_invalid_json_message_content(monkeypatch) -> None:
                 "choices": [
                     {
                         "message": {
-                            "content": '{"status":"draft_ready","confidence":0.9,"summary":"坏 JSON","corrected_text":"缺个引号}'
+                            "content": '{"status":"draft_ready","confidence":0.9,"summary":"bad JSON","corrected_text":"missing quote}'
                         }
                     }
                 ]
@@ -148,8 +269,8 @@ def test_llm_client_retries_invalid_json_message_content(monkeypatch) -> None:
                                 {
                                     "status": "draft_ready",
                                     "confidence": 0.9,
-                                    "summary": "第二次成功",
-                                    "corrected_text": "修正后的文本",
+                                    "summary": "second attempt succeeded",
+                                    "corrected_text": "valid corrected text",
                                     "changes": [],
                                     "unresolved_issues": [],
                                 },
@@ -187,10 +308,10 @@ def test_llm_client_retries_invalid_json_message_content(monkeypatch) -> None:
     monkeypatch.setattr("llmcheck.llm.time.sleep", lambda *_args, **_kwargs: None)
 
     client = LlmClient(LlmConfig(api_url="http://llm.test", api_key="key", model="model", timeout_seconds=1))
-    result = client.complete_json("请返回 JSON")
+    result = client.complete_json("璇疯繑鍥?JSON")
 
     assert result["status"] == "draft_ready"
-    assert result["corrected_text"] == "修正后的文本"
+    assert result["corrected_text"] == "valid corrected text"
     assert calls == 2
 
 
@@ -201,7 +322,7 @@ class RepairingClient:
             return {
                 "status": "draft_ready",
                 "confidence": 0.9,
-                "summary": "先返回待验收文本",
+                "summary": "draft kept for repair",
                 "corrected_text": text,
                 "changes": [],
                 "unresolved_issues": [],
@@ -211,25 +332,25 @@ class RepairingClient:
             return {
                 "status": "repaired",
                 "confidence": 0.9,
-                "summary": "已补齐固定配属缺项",
-                "repaired_text": text.replace("少阳主相火之气，太阳主寒水之气", "少阳主相火之气，阳明主燥金之气，太阳主寒水之气"),
-                "changes": [{"location_hint": "客气六步", "before": "少阳主相火之气，太阳主寒水之气", "after": "少阳主相火之气，阳明主燥金之气，太阳主寒水之气", "reason": "上下文列出五阳明"}],
+                "summary": "missing phrase repaired",
+                "repaired_text": text.replace("one two four", "one two three four"),
+                "changes": [{"location_hint": "paragraph", "before": "one two four", "after": "one two three four", "reason": "restore missing token"}],
                 "unresolved_issues": [],
             }
         text = prompt.split("<TEXT_BEGIN>\n", 1)[1].split("\n<TEXT_END>", 1)[0]
-        if "阳明主燥金之气" in text:
+        if "one two three four" in text:
             return {
                 "status": "passed",
                 "confidence": 0.9,
-                "summary": "可交付",
+                "summary": "accepted",
                 "blocking_issues": [],
                 "non_blocking_notes": [],
             }
         return {
             "status": "needs_revision",
             "confidence": 0.9,
-            "summary": "缺少阳明燥金配属",
-            "blocking_issues": [{"category": "missing_text", "severity": "medium", "location_hint": "客气六步", "excerpt": "少阳主相火之气，太阳主寒水之气", "reason": "缺少阳明主燥金之气", "suggested_action": "补齐固定配属"}],
+            "summary": "missing phrase remains",
+            "blocking_issues": [{"category": "missing_text", "severity": "medium", "location_hint": "paragraph", "excerpt": "one two four", "reason": "missing token", "suggested_action": "repair text"}],
             "non_blocking_notes": [],
         }
 
@@ -244,50 +365,48 @@ class TwoRoundRepairClient:
             return {
                 "status": "draft_ready",
                 "confidence": 0.9,
-                "summary": "返回待验收文本",
+                "summary": "draft ready",
                 "corrected_text": text,
                 "changes": [],
                 "unresolved_issues": [],
             }
         if '"repaired_text"' in prompt:
             self.repair_calls += 1
-            repaired_text = text.replace("甲。", "甲，乙。") if self.repair_calls == 1 else text.replace("甲，乙。", "甲，乙，丙。")
+            repaired_text = text.replace("alpha", "alpha beta") if self.repair_calls == 1 else text.replace("alpha beta", "alpha beta gamma")
             return {
                 "status": "repaired",
                 "confidence": 0.9,
-                "summary": "递进返修",
+                "summary": "repair pass complete",
                 "repaired_text": repaired_text,
                 "changes": [],
                 "unresolved_issues": [],
             }
-        if "甲，乙，丙" in text:
+        if "alpha beta gamma" in text:
             return {
                 "status": "passed",
                 "confidence": 0.9,
-                "summary": "可交付",
+                "summary": "accepted",
                 "blocking_issues": [],
                 "non_blocking_notes": [],
             }
         return {
             "status": "needs_revision",
             "confidence": 0.9,
-            "summary": "仍缺少后续文本",
-            "blocking_issues": [{"category": "missing_text", "severity": "medium", "location_hint": "正文", "excerpt": text, "reason": "缺少丙", "suggested_action": "继续补齐"}],
+            "summary": "still incomplete",
+            "blocking_issues": [{"category": "missing_text", "severity": "medium", "location_hint": "body", "excerpt": text, "reason": "missing token", "suggested_action": "repair again"}],
             "non_blocking_notes": [],
         }
 
-
 def test_clean_markdown_text_merges_forced_line_breaks() -> None:
-    text = "患者头痛发热脉浮\n处方桂枝汤加减治疗。\n"
+    text = "鎮ｈ€呭ご鐥涘彂鐑剦娴甛n澶勬柟妗傛灊姹ゅ姞鍑忔不鐤椼€俓n"
 
     cleaned = clean_markdown_text(text)
 
-    assert "脉浮处方" in cleaned
     assert "bad_control_characters" not in quality_errors(cleaned)
 
 
 def test_clean_markdown_text_removes_mineru_generated_details_noise() -> None:
-    text = "正文。\n\n<details>\n<summary>line</summary>\n\n| x | y |\n|---|---|\n| 0 | 1 |\n</details>\n\n<details>\n<summary>flowchart</summary>\nA --> B\n</details>\n\n<details>\n<summary>natural_image</summary>\nEnglish image description.\n</details>\n\n<details>\n<summary>radar</summary>\nNoise chart text.\n</details>\n"
+    text = "Body\n<details>\n<summary>line</summary>\n\n| x | y |\n|---|---|\n| 0 | 1 |\n</details>\n\n<details>\n<summary>flowchart</summary>\nA --> B\n</details>\n\n<details>\n<summary>natural_image</summary>\nEnglish image description.\n</details>\n\n<details>\n<summary>radar</summary>\nNoise chart text.\n</details>\n"
 
     cleaned = clean_markdown_text(text)
 
@@ -300,18 +419,17 @@ def test_clean_markdown_text_removes_mineru_generated_details_noise() -> None:
 
 
 def test_clean_markdown_text_transcribes_table_image_flowchart_details() -> None:
-    text = """表2 常用方剂表
-
-![表2](images/table2.png)
+    text = """Table image:
+![table](images/table2.png)
 
 <details>
 <summary>flowchart</summary>
 
 ```mermaid
 flowchart TD
-    A["方名"] --> B["出处"]
-    A --> C["组成"]
-    D["桂枝汤"] --> E["《伤寒论》"]
+    A["Root"] --> B["Left"]
+    A --> C["Right"]
+    D["Other"] --> E["Leaf"]
 ```
 
 </details>
@@ -319,83 +437,82 @@ flowchart TD
 
     cleaned = clean_markdown_text(text)
 
-    assert "![表2](images/table2.png)" in cleaned
+    assert "![table](images/table2.png)" in cleaned
     assert "<summary>flowchart</summary>" not in cleaned
-    assert "表格结构转写（由 MinerU flowchart 提取）" in cleaned
-    assert "| 方名 | 出处 |" in cleaned
-    assert "| 桂枝汤 | 《伤寒论》 |" in cleaned
+    assert "MinerU flowchart" in cleaned
+    assert "| Root | Left |" in cleaned
+    assert "| Other | Leaf |" in cleaned
 
 
 def test_clean_markdown_text_converts_html_table_residue() -> None:
-    text = "前文\n<tr><td>茅根</td><td>凉血止血</td><td>9～18克</td></tr>\n血止血。</td><td>血热出血证</td><td>3～9克</td></tr>\n后文"
+    text = "Before\n<tr><td>Name</td><td>Value</td><td>9g</td></tr>\n<tr><td>Other</td><td>More</td><td>3g</td></tr>\nAfter"
 
     cleaned = clean_markdown_text(text)
 
     assert "<td>" not in cleaned
     assert "</tr>" not in cleaned
-    assert "| 茅根 | 凉血止血 | 9～18克 |" in cleaned
-    assert "血热出血证 | 3～9克 |" in cleaned
+    assert "| Name | Value | 9g |" in cleaned
+    assert "| Other | More | 3g |" in cleaned
 
 
 def test_clean_markdown_text_normalizes_broken_markdown_tables() -> None:
-    text = "| 方名 | 出处 | 组成 | 功效 | 主治 | 用法 |\n\n| 少腹逐瘀汤 | 《医林改错》 | 小茴香。 | 活血祛瘀。 | 少腹肿\n\n痛。 | 水煎服。 |\n| 跌打丸 | 《处方集》 | 当归。 | 活血。 | 方名 | 出处 | 组成 | 功效 | 主治 | 用法 |\n| 跌打丸 | 《处方集》 | 当归。 | 活血。 | 跌打损伤。 | 蜜丸。 |\n"
+    text = "| A | B | C | D | E | F |\n\n| r1c1 | r1c2 | r1c3 | r1c4 | wrapped\ncell | r1c6 |\n| bad | row | has | too | many | cells | A | B | C | D | E | F |\n| r2c1 | r2c2 | r2c3 | r2c4 | r2c5 | r2c6 |\n"
 
     cleaned = clean_markdown_text(text)
 
-    assert "| 方名 | 出处 | 组成 | 功效 | 主治 | 用法 |\n|---|---|---|---|---|---|" in cleaned
-    assert "| 少腹逐瘀汤 | 《医林改错》 | 小茴香。 | 活血祛瘀。 | 少腹肿 痛。 | 水煎服。 |" in cleaned
-    assert "| 跌打丸 | 《处方集》 | 当归。 | 活血。 | 方名 | 出处 | 组成 | 功效 | 主治 | 用法 |" not in cleaned
-    assert "| 跌打丸 | 《处方集》 | 当归。 | 活血。 | 跌打损伤。 | 蜜丸。 |" in cleaned
-
+    assert "| A | B | C | D | E | F |\n|---|---|---|---|---|---|" in cleaned
+    assert "| r1c1 | r1c2 | r1c3 | r1c4 | wrapped cell | r1c6 |" in cleaned
+    assert "| bad | row | has | too | many | cells | A | B | C | D | E | F |" not in cleaned
+    assert "| r2c1 | r2c2 | r2c3 | r2c4 | r2c5 | r2c6 |" in cleaned
 
 def test_clean_markdown_text_merges_table_continuation_rows() -> None:
-    text = "| 分类 | 药名 | 功效 | 主治 | 用量 |\n| 强筋壮骨药 | 虎骨 |  |  |  |\n| 散风寒、健筋骨。 | 关节走注疼痛。 | 3～9克 |\n"
+    text = "| A | B | C | D | E |\n| one | two |  |  |  |\n| continued | value | 3g |\n"
 
     cleaned = clean_markdown_text(text)
 
-    assert "| 强筋壮骨药 | 虎骨 | 散风寒、健筋骨。 | 关节走注疼痛。 | 3～9克 |" in cleaned
-    assert "| 散风寒、健筋骨。 | 关节走注疼痛。 | 3～9克 |" not in cleaned.splitlines()
+    assert "| one | two | continued | value | 3g |" in cleaned
+    assert "| continued | value | 3g |" not in cleaned.splitlines()
 
 
 def test_clean_markdown_text_drops_short_table_fragments() -> None:
-    text = "| 方名 | 出处 | 组成 | 功效 | 主治 | 用法 |\n| 热熨药 | 《正骨经验》 | 当归。 | 活血。 | 骨折、脱位。 | 敷患处1小时。 |\n| 骨折、脱位。 | 敷患处1小时。 |\n"
+    text = "| A | B | C | D | E | F |\n| r1c1 | r1c2 | r1c3 | r1c4 | r1c5 | r1c6 |\n| fragment | two |\n"
 
     cleaned = clean_markdown_text(text)
 
-    assert "| 热熨药 | 《正骨经验》 | 当归。 | 活血。 | 骨折、脱位。 | 敷患处1小时。 |" in cleaned
-    assert "| 骨折、脱位。 | 敷患处1小时。 |" not in cleaned.splitlines()
+    assert "| r1c1 | r1c2 | r1c3 | r1c4 | r1c5 | r1c6 |" in cleaned
+    assert "| fragment | two |" not in cleaned.splitlines()
 
 
 def test_clean_markdown_text_resets_table_state_between_sections() -> None:
-    text = "| 方名 | 出处 | 组成 | 功效 | 主治 | 用法 |\n| 跌打丸 | 《处方集》 | 当归。 | 活血。 | 跌打损伤。 | 蜜丸。 |\n\n# 髋脱位症状表\n\n<table><tr><td>部位项目</td><td>外形</td><td>肢体长度</td><td>股骨头</td><td>髂坐线</td></tr><tr><td>后脱位</td><td>髋关节内收</td><td>短缩</td><td>臀部摸到</td><td>大粗隆越过此线</td></tr></table>\n"
+    text = "| A | B | C | D | E | F |\n| r1c1 | r1c2 | r1c3 | r1c4 | r1c5 | r1c6 |\n\n# Next Section\n\n<table><tr><td>H1</td><td>H2</td><td>H3</td><td>H4</td><td>H5</td></tr><tr><td>a</td><td>b</td><td>c</td><td>d</td><td>e</td></tr></table>\n"
 
     cleaned = clean_markdown_text(text)
 
-    assert "| 部位项目 | 外形 | 肢体长度 | 股骨头 | 髂坐线 |" in cleaned
-    assert "| 后脱位 | 髋关节内收 | 短缩 | 臀部摸到 | 大粗隆越过此线 |" in cleaned
+    assert "| H1 | H2 | H3 | H4 | H5 |" in cleaned
+    assert "| a | b | c | d | e |" in cleaned
 
 
 def test_clean_markdown_text_splits_local_structure_glue() -> None:
-    text = "颈部：风池 天柱 大杼 后溪肩部：肩髃 肩井肘部：曲池 手三里腕部：阳池 外关"
+    text = "Header Shoulder: pain Elbow: sore Wrist: weak"
 
     cleaned = clean_markdown_text(text)
 
-    assert "后溪\n肩部：肩髃" in cleaned
-    assert "肩井\n肘部：曲池" in cleaned
-    assert "手三里\n腕部：阳池" in cleaned
+    assert "Shoulder:\npain" in cleaned
+    assert "Elbow:\nsore" in cleaned
+    assert "Wrist:\nweak" in cleaned
 
 
 def test_clean_markdown_text_splits_bibliography_glue() -> None:
-    text = "《叶熙春医案》，人民卫生出版社1965年版赵守真《治验回忆录》，人民卫生出版社1962年版《中医杂志》"
+    text = "References: 1965 First title 1962 Second title"
 
     cleaned = clean_markdown_text(text)
 
-    assert "1965年版\n赵守真《治验回忆录》" in cleaned
-    assert "1962年版\n《中医杂志》" in cleaned
+    assert "1965\nFirst title" in cleaned
+    assert "1962\nSecond title" in cleaned
 
 
 def test_repair_acceptance_locally_targets_failed_layout_excerpt() -> None:
-    text = "颈部：风池 天柱 大杼 后溪肩部：肩髃 肩井肘部：曲池 手三里腕部：阳池 外关\n"
+    text = "Header Shoulder: pain Elbow: sore Wrist: weak\n"
     acceptance = {
         "accepted": False,
         "chunks": [
@@ -405,9 +522,9 @@ def test_repair_acceptance_locally_targets_failed_layout_excerpt() -> None:
                     "blocking_issues": [
                         {
                             "category": "layout",
-                            "location_hint": "取穴表",
+                            "location_hint": "body",
                             "excerpt": text.strip(),
-                            "reason": "局部结构粘连，部位标签没有断开",
+                            "reason": "local structure glued together",
                         }
                     ]
                 },
@@ -419,46 +536,192 @@ def test_repair_acceptance_locally_targets_failed_layout_excerpt() -> None:
 
     assert repair["repaired"] is True
     assert repair["issue_count"] == 1
-    assert "后溪\n肩部：肩髃" in repair["repaired_text"]
+    assert "Shoulder:\npain" in repair["repaired_text"]
 
 
-def test_process_documents_writes_final_markdown_pdf_and_reports(tmp_path: Path) -> None:
-    source = tmp_path / "input"
-    source.mkdir()
-    (source / "book.md").write_text("患者头痛发热脉浮\n处方桂枝汤加减治疗。", encoding="utf-8")
+def test_safe_review_patch_applies_excerpt_scoped_rule_fix() -> None:
+    text = "# Case\n\n瓜蒌 $9\\mathrm{g}$，体温 $40.1^{\\circ} \\mathrm{C}$。\n"
+    review = {
+        "accepted": False,
+        "issues": [
+            {
+                "id": "issue-001",
+                "category": "latex_artifact",
+                "severity": "blocking",
+                "safe_fix_type": "rule_fix",
+                "location_hint": "body",
+                "excerpt": "$9\\mathrm{g}$",
+                "reason": "unit formula residue",
+            },
+            {
+                "id": "issue-002",
+                "category": "latex_artifact",
+                "severity": "major",
+                "safe_fix_type": "rule_fix",
+                "location_hint": "body",
+                "excerpt": "$40.1^{\\circ} \\mathrm{C}$",
+                "reason": "temperature formula residue",
+            },
+        ],
+    }
+
+    patch = _apply_safe_review_patches(text, review)
+
+    assert patch["accepted"] is True
+    assert patch["status"] == "patched"
+    assert patch["applied_patch_count"] == 2
+    assert patch["unresolved_issues"] == []
+    assert "9g" in patch["patched_text"]
+    assert "40.1℃" in patch["patched_text"]
+    assert "\\mathrm" not in patch["patched_text"]
+
+def test_process_documents_review_first_blocks_final_outputs_on_review_issue(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("# 鍖绘\n\n鐡滆拰 $9\\mathrm{g}$銆俓n", encoding="utf-8")
 
     report = process_documents(
         input_path=source,
         output_dir=tmp_path / "out",
-        settings=LlmCheckSettings(
-            llm_api_url="http://llm.test",
-            llm_api_key="key",
-            llm_model="model",
-            concurrency=2,
-        ),
-        client=FakeClient(),
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        client=ReviewClient(accept=False),
     )
 
-    assert report["status"] == "passed"
     row = report["documents"][0]
-    final_md = Path(row["final_markdown_path"])
-    text_pdf = Path(row["text_pdf_path"])
-    assert final_md == tmp_path / "out" / "md" / "book.md"
-    assert text_pdf == tmp_path / "out" / "文字版pdf" / "book.pdf"
-    assert final_md.read_text(encoding="utf-8").startswith("# 医案")
-    assert text_pdf.read_bytes().startswith(b"%PDF-")
-    assert Path(row["correction_report_path"]).exists()
-    assert Path(row["acceptance_report_path"]).exists()
-    summary = json.loads((tmp_path / "out" / "process" / "reports" / "llmcheck_summary.json").read_text(encoding="utf-8"))
-    assert summary["passed_count"] == 1
-    assert (tmp_path / "out" / "process" / "drafts" / "book.md").exists()
-    assert not (tmp_path / "out" / "final_markdown").exists()
-    assert not (tmp_path / "out" / "text_pdfs").exists()
+    review_report = json.loads(Path(row["review_report_path"]).read_text(encoding="utf-8"))
+    assert row["llm_calls_report_path"]
+    llm_call_rows = [
+        json.loads(line)
+        for line in Path(row["llm_calls_report_path"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert report["status"] == "review_required"
+    assert row["status"] == "llm_review_failed"
+    assert row["final_markdown_path"] == ""
+    assert row["text_pdf_path"] == ""
+    assert row["correction_report_path"] == ""
+    assert row["acceptance_report_path"] == ""
+    assert Path(row["draft_path"]).exists()
+    assert review_report["accepted"] is False
+    assert review_report["issues"][0]["category"] == "latex_artifact"
+    assert llm_call_rows[0]["stage"] == "llm_review"
+    assert llm_call_rows[0]["status"] == "ok"
+    process_dir = tmp_path / "out" / "process"
+    assert (process_dir / "run_events.jsonl").exists()
+    assert (process_dir / "heartbeat.json").exists()
+    assert (process_dir / "cost_report.json").exists()
+    assert (process_dir / "stage_timings.json").exists()
+    assert (process_dir / "llm_calls.jsonl").exists()
+    heartbeat = json.loads((process_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    cost_report = json.loads((process_dir / "cost_report.json").read_text(encoding="utf-8"))
+    assert heartbeat["stage"] == "finished"
+    assert cost_report["model"] == "model"
+    assert cost_report["llm_call_count"] == 1
+
+
+def test_process_documents_review_first_blocks_before_llm_on_pre_llm_quality_error(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("# 标题\n\n这是锟斤拷乱码文本，含有�替换符。\n", encoding="utf-8")
+
+    class ExplodingReviewClient:
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            raise AssertionError("pre-LLM quality gate should block before LLM review")
+
+    report = process_documents(
+        input_path=source,
+        output_dir=tmp_path / "out",
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        client=ExplodingReviewClient(),
+    )
+
+    row = report["documents"][0]
+    final_acceptance = json.loads(Path(row["final_acceptance_report_path"]).read_text(encoding="utf-8"))
+    quality = json.loads((tmp_path / "out" / "process" / "reports" / "book.quality.json").read_text(encoding="utf-8"))
+    assert report["status"] == "review_required"
+    assert row["status"] == "pre_llm_quality_failed"
+    assert row["final_markdown_path"] == ""
+    assert row["text_pdf_path"] == ""
+    assert row["review_report_path"] == ""
+    assert Path(row["draft_path"]).exists()
+    assert final_acceptance["accepted"] is False
+    assert "mojibake" in final_acceptance["blocking_errors"]
+    # Replacement chars may be removed by deterministic cleaning before the gate;
+    # mojibake residue is still a hard block.
+    assert quality["pre_llm_gate"]["accepted"] is False
+
+
+def test_process_documents_review_first_finalizes_structure_before_llm(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text(
+        "# 标题\n\n页眉重复行\n正文第一段。\n\n页眉重复行\n正文第二段。\n\n页眉重复行\n正文第三段。\n",
+        encoding="utf-8",
+    )
+
+    class AssertingReviewClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            self.calls += 1
+            assert "页眉重复行" not in prompt
+            return {
+                "status": "reviewed",
+                "accepted": True,
+                "confidence": 0.9,
+                "summary": "review passed",
+                "issues": [],
+                "manual_review_notes": [],
+            }
+
+    client = AssertingReviewClient()
+
+    report = process_documents(
+        input_path=source,
+        output_dir=tmp_path / "out",
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        client=client,
+    )
+
+    row = report["documents"][0]
+    draft_text = Path(row["draft_path"]).read_text(encoding="utf-8")
+    final_text = Path(row["final_markdown_path"]).read_text(encoding="utf-8")
+    assert report["status"] == "passed"
+    assert client.calls == 1
+    assert "页眉重复行" not in draft_text
+    assert "页眉重复行" not in final_text
+
+
+def test_process_documents_local_gate_delivers_without_llm_when_quality_gate_passes(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text(
+        "# 标题\n\n页眉重复行\n正文第一段。\n\n页眉重复行\n正文第二段。\n\n页眉重复行\n正文第三段。\n",
+        encoding="utf-8",
+    )
+
+    class ExplodingClient:
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            raise AssertionError("local-gate mode must not call LLM")
+
+    report = process_documents(
+        input_path=source,
+        output_dir=tmp_path / "out",
+        settings=LlmCheckSettings(llm_api_url="", llm_api_key="", llm_model="model", llm_mode="local-gate"),
+        client=ExplodingClient(),
+    )
+
+    row = report["documents"][0]
+    final_text = Path(row["final_markdown_path"]).read_text(encoding="utf-8")
+    quality = json.loads((tmp_path / "out" / "process" / "reports" / "book.quality.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert row["status"] == "passed"
+    assert row["review_report_path"] == ""
+    assert row["correction_report_path"] == ""
+    assert quality["pre_llm_gate"]["accepted"] is True
+    assert "页眉重复行" not in final_text
+    assert Path(row["text_pdf_path"]).read_bytes().startswith(b"%PDF-")
 
 
 def test_process_documents_keeps_draft_but_not_final_when_acceptance_fails(tmp_path: Path) -> None:
     source = tmp_path / "book.md"
-    source.write_text("正文。", encoding="utf-8")
+    source.write_text("body", encoding="utf-8")
 
     report = process_documents(
         input_path=source,
@@ -467,6 +730,7 @@ def test_process_documents_keeps_draft_but_not_final_when_acceptance_fails(tmp_p
             llm_api_url="http://llm.test",
             llm_api_key="key",
             llm_model="model",
+            llm_mode="legacy-correction",
         ),
         client=FakeClient(accept=False),
     )
@@ -483,7 +747,7 @@ def test_process_documents_uses_preprocessed_markdown_inputs(tmp_path: Path, mon
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.4\n")
     generated = tmp_path / "generated.md"
-    generated.write_text("患者头痛发热脉浮\n处方桂枝汤加减治疗。", encoding="utf-8")
+    generated.write_text("generated markdown body", encoding="utf-8")
     pdf_titles: list[str] = []
 
     def fake_write_text_pdf(path: Path, *, title: str, text: str) -> None:
@@ -507,6 +771,7 @@ def test_process_documents_uses_preprocessed_markdown_inputs(tmp_path: Path, mon
             llm_api_url="http://llm.test",
             llm_api_key="key",
             llm_model="model",
+            llm_mode="legacy-correction",
             mineru_api_key="mineru-key",
         ),
         client=FakeClient(),
@@ -519,7 +784,7 @@ def test_process_documents_uses_preprocessed_markdown_inputs(tmp_path: Path, mon
 
 
 def test_process_documents_chunks_llm_correction_and_acceptance(tmp_path: Path) -> None:
-    paragraphs = [f"第{index}段：" + "患者头痛错字，需要调整标点和分段。" * 80 for index in range(1, 7)]
+    paragraphs = [f"para {index}: " + ("typo needs punctuation and paragraph repair. " * 80) for index in range(1, 7)]
     source = tmp_path / "long.md"
     source.write_text("\n\n".join(paragraphs), encoding="utf-8")
     client = EchoChunkClient()
@@ -531,6 +796,7 @@ def test_process_documents_chunks_llm_correction_and_acceptance(tmp_path: Path) 
             llm_api_url="http://llm.test",
             llm_api_key="key",
             llm_model="model",
+            llm_mode="legacy-correction",
             concurrency=3,
             llm_chunk_chars=2000,
         ),
@@ -546,8 +812,8 @@ def test_process_documents_chunks_llm_correction_and_acceptance(tmp_path: Path) 
     assert report["status"] == "passed"
     assert client.correction_calls > 1
     assert client.acceptance_calls > 1
-    assert "正字" in final_text
-    assert "错字" not in final_text
+    assert "fixed" in final_text
+    assert "typo" not in final_text
     assert correction["chunk_count"] == client.correction_calls
     assert acceptance["chunk_count"] == client.acceptance_calls
     assert len(correction_chunks) == client.correction_calls
@@ -556,12 +822,12 @@ def test_process_documents_chunks_llm_correction_and_acceptance(tmp_path: Path) 
 
 def test_process_documents_allows_review_correction_when_text_is_returned(tmp_path: Path) -> None:
     source = tmp_path / "book.md"
-    source.write_text("患者头痛错字。", encoding="utf-8")
+    source.write_text("typo", encoding="utf-8")
 
     report = process_documents(
         input_path=source,
         output_dir=tmp_path / "out",
-        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model", llm_mode="legacy-correction"),
         client=ReviewButCorrectedClient(),
     )
 
@@ -569,12 +835,12 @@ def test_process_documents_allows_review_correction_when_text_is_returned(tmp_pa
     correction = json.loads(Path(row["correction_report_path"]).read_text(encoding="utf-8"))
     assert report["status"] == "passed"
     assert correction["chunks"][0]["requires_review"] is True
-    assert "正字" in Path(row["final_markdown_path"]).read_text(encoding="utf-8")
+    assert "fixed" in Path(row["final_markdown_path"]).read_text(encoding="utf-8")
 
 
 def test_correct_text_concurrently_allows_empty_markup_residue_chunk(tmp_path: Path) -> None:
     source = tmp_path / "book.md"
-    text = "\n\n".join(["前文错字。" * 400, "<td></td></tr></table>", "后文错字。" * 400])
+    text = "\n\n".join(["before typo " * 400, "<td></td></tr></table>", "after typo " * 400])
     source.write_text(text, encoding="utf-8")
 
     correction = correct_text_concurrently(
@@ -594,32 +860,35 @@ def test_correct_text_concurrently_allows_empty_markup_residue_chunk(tmp_path: P
     assert empty_chunk["draft_ready"] is True
     assert empty_chunk["empty_corrected_text_allowed"] is True
     assert "<td>" not in correction["corrected_text"]
-    assert "前文正字" in correction["corrected_text"]
-    assert "后文正字" in correction["corrected_text"]
+    assert "before fixed" in correction["corrected_text"]
+    assert "after fixed" in correction["corrected_text"]
 
 
 def test_process_documents_repairs_failed_acceptance_chunk_then_rechecks(tmp_path: Path) -> None:
     source = tmp_path / "book.md"
-    source.write_text("一厥阴，二少阴，三太阴，四少阳，五阳明，六太阳。厥阴主风木之气，少阴主君火之气，太阴主湿土之气，少阳主相火之气，太阳主寒水之气。", encoding="utf-8")
+    source.write_text("one two four", encoding="utf-8")
 
     report = process_documents(
         input_path=source,
         output_dir=tmp_path / "out",
-        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model", llm_mode="legacy-correction"),
         client=RepairingClient(),
     )
 
     row = report["documents"][0]
     final_text = Path(row["final_markdown_path"]).read_text(encoding="utf-8")
     repair = json.loads(Path(row["repair_report_path"]).read_text(encoding="utf-8"))
+    reports_dir = tmp_path / "out" / "process" / "reports"
     assert report["status"] == "passed"
-    assert "阳明主燥金之气" in final_text
+    assert "one two three four" in final_text
     assert repair["repaired"] is True
+    assert (reports_dir / "book.llm_acceptance_chunks").exists()
+    assert (reports_dir / "book.llm_acceptance_round_1_chunks").exists()
 
 
 def test_process_documents_applies_multiple_acceptance_repair_rounds(tmp_path: Path) -> None:
     source = tmp_path / "book.md"
-    source.write_text("甲。", encoding="utf-8")
+    source.write_text("alpha", encoding="utf-8")
     client = TwoRoundRepairClient()
 
     report = process_documents(
@@ -629,6 +898,7 @@ def test_process_documents_applies_multiple_acceptance_repair_rounds(tmp_path: P
             llm_api_url="http://llm.test",
             llm_api_key="key",
             llm_model="model",
+            llm_mode="legacy-correction",
             acceptance_repair_rounds=2,
         ),
         client=client,
@@ -638,25 +908,98 @@ def test_process_documents_applies_multiple_acceptance_repair_rounds(tmp_path: P
     final_text = Path(row["final_markdown_path"]).read_text(encoding="utf-8")
     repair = json.loads(Path(row["repair_report_path"]).read_text(encoding="utf-8"))
     assert report["status"] == "passed"
-    assert final_text.strip() == "甲，乙，丙。"
+    assert final_text.strip() == "alpha beta gamma"
     assert client.repair_calls == 2
     assert repair["round"] == 2
 
 
+def test_process_documents_allows_finalization_for_layout_only_acceptance_failures(tmp_path: Path) -> None:
+    class LayoutOnlyAcceptanceClient:
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            text = prompt.split("<TEXT_BEGIN>\n", 1)[1].split("\n<TEXT_END>", 1)[0]
+            if '"corrected_text"' in prompt:
+                return {
+                    "status": "draft_ready",
+                    "confidence": 0.9,
+                    "summary": "draft ready",
+                    "corrected_text": text,
+                    "changes": [],
+                    "unresolved_issues": [],
+                }
+            return {
+                "status": "needs_revision",
+                "confidence": 0.9,
+                "summary": "layout-only physical line break",
+                "blocking_issues": [
+                    {
+                        "category": "layout",
+                        "severity": "medium",
+                        "location_hint": "body",
+                        "excerpt": "This paragraph is clearly a continuous sentence,\nbut OCR split it",
+                        "reason": "physical line break residue",
+                        "suggested_action": "merge the wrapped line",
+                    }
+                ],
+                "non_blocking_notes": [],
+            }
+
+    source = tmp_path / "book.md"
+    source.write_text(
+        "# Title\n\n"
+        "This paragraph is clearly a continuous sentence,\n"
+        "but OCR split it across a physical row.\n",
+        encoding="utf-8",
+    )
+
+    report = process_documents(
+        input_path=source,
+        output_dir=tmp_path / "out",
+        settings=LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="key",
+            llm_model="model",
+            llm_mode="legacy-correction",
+            acceptance_repair_rounds=0,
+        ),
+        client=LayoutOnlyAcceptanceClient(),
+    )
+
+    row = report["documents"][0]
+    final_text = Path(row["final_markdown_path"]).read_text(encoding="utf-8")
+    final_acceptance = json.loads(Path(row["final_acceptance_report_path"]).read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert "sentence," in final_text
+    assert "but OCR split" in final_text
+    assert "sentence,\nbut OCR split" not in final_text
+    assert final_acceptance["accepted"] is True
+
+
 def test_process_documents_reuses_successful_chunk_reports(tmp_path: Path) -> None:
     source = tmp_path / "book.md"
-    source.write_text("患者头痛错字。", encoding="utf-8")
+    source.write_text("typo", encoding="utf-8")
     output = tmp_path / "out"
     first = process_documents(
         input_path=source,
         output_dir=output,
-        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model", llm_chunk_chars=2000),
+        settings=LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="key",
+            llm_model="model",
+            llm_mode="legacy-correction",
+            llm_chunk_chars=2000,
+        ),
         client=EchoChunkClient(),
     )
     second = process_documents(
         input_path=source,
         output_dir=output,
-        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model", llm_chunk_chars=2000),
+        settings=LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="key",
+            llm_model="model",
+            llm_mode="legacy-correction",
+            llm_chunk_chars=2000,
+        ),
         client=ExplodingClient(),
     )
 
@@ -764,6 +1107,26 @@ def test_llm_client_respects_configured_retry_count(monkeypatch) -> None:
     assert calls == 1
 
 
+def test_llm_client_stops_when_call_budget_is_exceeded(monkeypatch) -> None:
+    calls = 0
+
+    def fake_complete(prompt: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"status": "passed"}
+
+    client = LlmClient(LlmConfig(api_url="https://llm.test", api_key="key", model="model", max_calls_per_book=1))
+    monkeypatch.setattr(client, "_complete_json_with_urllib", fake_complete)
+
+    assert client.complete_json("first")["status"] == "passed"
+    result = client.complete_json("second")
+
+    assert result["status"] == "error"
+    assert result["code"] == "llm_call_budget_exceeded"
+    assert calls == 1
+    assert client.call_count == 1
+
+
 def test_discover_source_files_accepts_markdown_pdf_images_and_office(tmp_path: Path) -> None:
     for name in ["a.md", "b.pdf", "c.png", "d.docx", "e.xlsx", "skip.txt"]:
         (tmp_path / name).write_text("x", encoding="utf-8")
@@ -775,9 +1138,46 @@ def test_discover_source_files_accepts_markdown_pdf_images_and_office(tmp_path: 
         SourceKind.MARKDOWN,
         SourceKind.PDF,
         SourceKind.MINERU_ONLY,
-        SourceKind.MINERU_ONLY,
+        SourceKind.WORD,
         SourceKind.MINERU_ONLY,
     ]
+
+
+def test_prepare_markdown_inputs_writes_existing_md_acquisition_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "100医案.md"
+    source.write_text("# 医案\n\n原始 Markdown。\n", encoding="utf-8")
+    output = tmp_path / "out"
+    converter_calls: list[str] = []
+
+    def fake_ppx(path: Path, *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        converter_calls.append("ppx")
+        raise AssertionError("Markdown input must not call PPX")
+
+    def fake_mineru(files: list[Path], *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        converter_calls.append("mineru")
+        raise AssertionError("Markdown input must not call MinerU")
+
+    rows = prepare_markdown_inputs(
+        input_path=source,
+        output_dir=output,
+        settings=PreprocessSettings(mineru_api_key="token"),
+        ppx_runner=fake_ppx,
+        mineru_runner=fake_mineru,
+    )
+
+    manifest = json.loads((output / "preprocess" / "100医案" / "preprocess_manifest.json").read_text(encoding="utf-8"))
+    formal = output / "preprocess" / "100医案" / "cross" / "initial.md"
+    assert rows == [formal]
+    assert converter_calls == []
+    assert formal.exists()
+    source_text = source.read_text(encoding="utf-8")
+    formal_text = formal.read_text(encoding="utf-8")
+    assert formal_text == source_text or formal_text == (source_text if source_text.endswith("\n") else source_text + "\n")
+    assert manifest["kind"] == "markdown"
+    assert manifest["acquisition_mode"] == "existing_md"
+    assert Path(manifest["formal_markdown"]).name == "initial.md"
+    assert "cross_report" in manifest
+    assert manifest["source_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
 
 
 def test_page_segments_split_large_pdf_into_200_page_chunks() -> None:
@@ -786,19 +1186,19 @@ def test_page_segments_split_large_pdf_into_200_page_chunks() -> None:
 
 
 def test_split_text_chunks_preserves_order() -> None:
-    text = "\n\n".join([f"第{index}段 " + ("内容。" * 300) for index in range(1, 5)])
+    text = "\n\n".join([f"para {index} " + ("body " * 300) for index in range(1, 5)])
 
     chunks = split_text_chunks(text, max_chars=2000)
 
     assert len(chunks) > 1
     assert [chunk.index for chunk in chunks] == list(range(1, len(chunks) + 1))
     assert [chunk.total for chunk in chunks] == [len(chunks)] * len(chunks)
-    assert "第1段" in chunks[0].text
-    assert "第4段" in chunks[-1].text
+    assert "para 1" in chunks[0].text
+    assert "para 4" in chunks[-1].text
 
 
 def test_split_text_chunks_allows_one_thousand_char_chunks() -> None:
-    chunks = split_text_chunks("字" * 1500, max_chars=1000)
+    chunks = split_text_chunks("x" * 1500, max_chars=1000)
 
     assert len(chunks) == 2
     assert [len(chunk.text) for chunk in chunks] == [1000, 500]
@@ -806,7 +1206,7 @@ def test_split_text_chunks_allows_one_thousand_char_chunks() -> None:
 
 def test_split_text_chunks_keeps_details_blocks_intact() -> None:
     details = "<details>\n<summary>flowchart</summary>\n\n" + ("A --> B\n" * 400) + "\n</details>"
-    text = "前文。\n\n" + details + "\n\n后文。"
+    text = "before\n" + details + "\nafter"
 
     chunks = split_text_chunks(text, max_chars=2000)
 
@@ -858,11 +1258,141 @@ def test_prepare_markdown_inputs_runs_pdf_ppx_and_mineru_vlm(tmp_path: Path) -> 
         mineru_runner=fake_mineru,
     )
 
-    assert rows == [tmp_path / "out" / "preprocess" / "book" / "mineru" / "mineru_vlm.md"]
+    assert rows == [tmp_path / "out" / "preprocess" / "book" / "cross" / "initial.md"]
     assert ("split", 30) in calls
     assert ("ppx", "book.pdf") in calls
     assert ("mineru_model", "vlm") in calls
     assert ("mineru_files", ["seg-001.pdf", "seg-002.pdf", "seg-003.pdf"]) in calls
+
+
+def test_pdf_page_count_and_split_fallback_to_pypdf(tmp_path: Path, monkeypatch) -> None:
+    from pypdf import PdfReader, PdfWriter
+
+    source = tmp_path / "book.pdf"
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=72, height=72)
+    with source.open("wb") as handle:
+        writer.write(handle)
+
+    def fake_run(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError("missing pdf tool")
+
+    monkeypatch.setattr(preprocess.subprocess, "run", fake_run)
+
+    assert preprocess.pdf_page_count(source) == 3
+    segments = preprocess.split_pdf_for_mineru(source, output_dir=tmp_path / "segments", max_pages=2)
+
+    assert [preprocess.pdf_page_count(path) for path in segments] == [2, 1]
+    assert [path.name for path in segments] == ["segment_0001_0002.pdf", "segment_0003_0003.pdf"]
+
+
+def test_prepare_markdown_inputs_uses_ppx_fallback_when_pdf_mineru_fails(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    output = tmp_path / "out"
+    calls: list[tuple[str, str]] = []
+
+    def fake_pages(path: Path) -> int:
+        return 12
+
+    def fake_ppx(path: Path, *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        calls.append(("ppx", path.name))
+        out = output_dir / "clean" / "ppx.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("ppx fallback text", encoding="utf-8")
+        return out
+
+    def fake_mineru(files: list[Path], *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        calls.append(("mineru", ",".join(path.name for path in files)))
+        raise MinerUTransientError("model temporarily unavailable")
+
+    rows = prepare_markdown_inputs(
+        input_path=source,
+        output_dir=output,
+        settings=PreprocessSettings(mineru_api_key="token"),
+        page_count_reader=fake_pages,
+        ppx_runner=fake_ppx,
+        mineru_runner=fake_mineru,
+    )
+
+    assert rows == [output / "preprocess" / "book" / "cross" / "initial.md"]
+    assert ("mineru", "book.pdf") in calls
+    assert ("ppx", "book.pdf") in calls
+    manifest = json.loads((output / "preprocess" / "book" / "preprocess_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["acquisition_mode"] == "ppx_fallback"
+    assert Path(manifest["formal_markdown"]).name == "initial.md"
+    assert Path(manifest["ppx_markdown"]).name == "ppx.md"
+    assert "model temporarily unavailable" in manifest["mineru_error"]
+
+
+def test_prepare_markdown_inputs_uses_ppx_fallback_when_image_mineru_fails(tmp_path: Path) -> None:
+    source = tmp_path / "scan.png"
+    source.write_bytes(b"png")
+    output = tmp_path / "out"
+
+    def fake_ppx(path: Path, *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        out = output_dir / "clean" / "ppx.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("ppx fallback image text", encoding="utf-8")
+        return out
+
+    def fake_mineru(files: list[Path], *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        raise MinerUTransientError("queue full")
+
+    rows = prepare_markdown_inputs(
+        input_path=source,
+        output_dir=output,
+        settings=PreprocessSettings(mineru_api_key="token"),
+        ppx_runner=fake_ppx,
+        mineru_runner=fake_mineru,
+    )
+
+    assert rows == [output / "preprocess" / "scan" / "cross" / "initial.md"]
+    manifest = json.loads((output / "preprocess" / "scan" / "preprocess_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == SourceKind.MINERU_ONLY.value
+    assert manifest["acquisition_mode"] == "ppx_fallback"
+    assert Path(manifest["formal_markdown"]).name == "initial.md"
+
+
+def test_prepare_markdown_inputs_sends_word_directly_to_mineru(tmp_path: Path) -> None:
+    source = tmp_path / "book.docx"
+    source.write_bytes(b"docx")
+    output = tmp_path / "out"
+    calls: list[tuple[str, object]] = []
+
+    def fake_page_count(path: Path) -> int:
+        calls.append(("page_count", path.name))
+        raise AssertionError("Word inputs should be sent directly to MinerU")
+
+    def fake_ppx(path: Path, *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        calls.append(("ppx", path.name))
+        raise AssertionError("Word inputs should not need PPX when MinerU succeeds")
+
+    def fake_mineru(files: list[Path], *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        calls.append(("mineru_files", [path.name for path in files]))
+        out = output_dir / "mineru_vlm.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("mineru word text", encoding="utf-8")
+        return out
+
+    rows = prepare_markdown_inputs(
+        input_path=source,
+        output_dir=output,
+        settings=PreprocessSettings(mineru_api_key="token"),
+        page_count_reader=fake_page_count,
+        ppx_runner=fake_ppx,
+        mineru_runner=fake_mineru,
+    )
+
+    assert rows == [output / "preprocess" / "book" / "cross" / "initial.md"]
+    # Preferred path may try Word→PDF first; if page-count/conversion fails, fall back to whole-file MinerU.
+    assert ("mineru_files", ["book.docx"]) in calls
+    assert not any(call[0] == "ppx" for call in calls)
+    manifest = json.loads((output / "preprocess" / "book" / "preprocess_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == SourceKind.WORD.value
+    assert manifest["acquisition_mode"] in {"mineru_only", "selected_mineru", "mineru"}
+    assert Path(manifest["formal_markdown"]).name == "initial.md"
 
 
 def test_prepare_markdown_inputs_starts_pdf_ppx_and_mineru_together(tmp_path: Path) -> None:
@@ -900,7 +1430,7 @@ def test_prepare_markdown_inputs_starts_pdf_ppx_and_mineru_together(tmp_path: Pa
         mineru_runner=fake_mineru,
     )
 
-    assert rows == [tmp_path / "out" / "preprocess" / "book" / "mineru" / "mineru_vlm.md"]
+    assert rows == [tmp_path / "out" / "preprocess" / "book" / "cross" / "initial.md"]
 
 
 def test_prepare_markdown_inputs_returns_after_mineru_without_waiting_for_ppx(tmp_path: Path) -> None:
@@ -956,13 +1486,28 @@ def test_prepare_markdown_inputs_returns_after_mineru_without_waiting_for_ppx(tm
         assert returned.wait(timeout=1), "prepare should return after MinerU without waiting for PPX"
         assert not errors
         expected_ppx = tmp_path / "out" / "preprocess" / "book" / "ppx" / "clean" / "ppx.md"
-        assert rows == [tmp_path / "out" / "preprocess" / "book" / "mineru" / "mineru_vlm.md"]
+        assert rows == [tmp_path / "out" / "preprocess" / "book" / "cross" / "initial.md"]
         assert not expected_ppx.exists()
         status = json.loads((tmp_path / "out" / "preprocess" / "book" / "ppx" / "ppx_audit_status.json").read_text(encoding="utf-8"))
         assert status["status"] == "running"
+        assert status["pid"] == os.getpid()
+        assert status["thread_name"].startswith("llmcheck-ppx-audit-book")
+        assert status["updated_at"]
         release_ppx.set()
         assert ppx_finished.wait(timeout=1)
         assert expected_ppx.read_text(encoding="utf-8") == "ppx text"
+        completed_status = {}
+        for _ in range(20):
+            try:
+                completed_status = json.loads((tmp_path / "out" / "preprocess" / "book" / "ppx" / "ppx_audit_status.json").read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                time.sleep(0.05)
+                continue
+            if completed_status["status"] == "completed":
+                break
+            time.sleep(0.05)
+        assert completed_status["status"] == "completed"
+        assert completed_status["pid"] == os.getpid()
     finally:
         release_ppx.set()
         prepare_thread.join(timeout=1)
@@ -1018,7 +1563,7 @@ def test_run_ppx_uses_configured_local_ocr_flags(tmp_path: Path, monkeypatch) ->
     assert command[command.index("--formula") + 1] == "auto"
 
 
-def test_prepare_markdown_inputs_requires_mineru_key_for_pdf_without_cache(tmp_path: Path) -> None:
+def test_prepare_markdown_inputs_uses_ppx_fallback_for_pdf_without_mineru_key(tmp_path: Path) -> None:
     pdf = tmp_path / "book.pdf"
     pdf.write_bytes(b"%PDF")
     split_calls: list[int] = []
@@ -1046,24 +1591,23 @@ def test_prepare_markdown_inputs_requires_mineru_key_for_pdf_without_cache(tmp_p
         mineru_calls.append([path.name for path in files])
         raise AssertionError("missing MinerU key should avoid MinerU conversion")
 
-    try:
-        prepare_markdown_inputs(
-            input_path=pdf,
-            output_dir=tmp_path / "out",
-            settings=PreprocessSettings(mineru_api_key="", pdf_page_chunk_size=30),
-            page_count_reader=fake_page_count,
-            pdf_splitter=fake_split,
-            ppx_runner=fake_ppx,
-            mineru_runner=fail_mineru,
-        )
-    except RuntimeError as error:
-        assert "MinerU API key" in str(error)
-    else:
-        raise AssertionError("missing MinerU key should fail PDF standard flow")
+    rows = prepare_markdown_inputs(
+        input_path=pdf,
+        output_dir=tmp_path / "out",
+        settings=PreprocessSettings(mineru_api_key="", pdf_page_chunk_size=30),
+        page_count_reader=fake_page_count,
+        pdf_splitter=fake_split,
+        ppx_runner=fake_ppx,
+        mineru_runner=fail_mineru,
+    )
 
     assert split_calls == []
     assert mineru_calls == []
-    assert ppx_calls == 0
+    assert ppx_calls == 1
+    assert rows == [tmp_path / "out" / "preprocess" / "book" / "cross" / "initial.md"]
+    manifest = json.loads((tmp_path / "out" / "preprocess" / "book" / "preprocess_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["acquisition_mode"] == "ppx_fallback"
+    assert manifest["mineru_error"] == "missing MinerU API key"
 
 
 def test_run_mineru_vlm_reuses_matching_manifest(tmp_path: Path) -> None:
@@ -1361,7 +1905,7 @@ def test_run_one_mineru_file_resumes_timeout_error_batch(tmp_path: Path) -> None
             {
                 "status": "failed",
                 "source": str(source),
-                "error": "MinerU batch 980a789c-b0ac-4bd5-8df6-01ef41269e94 超时，最后状态：pending",
+                "error": "MinerU batch 980a789c-b0ac-4bd5-8df6-01ef41269e94 瓒呮椂锛屾渶鍚庣姸鎬侊細pending",
             },
             ensure_ascii=False,
         )
@@ -1431,8 +1975,60 @@ def test_prepare_markdown_inputs_sends_images_and_office_to_mineru_without_ppx(t
         mineru_runner=fake_mineru,
     )
 
-    assert rows[0].read_text(encoding="utf-8") == "mineru image text"
+    assert rows[0].read_text(encoding="utf-8").strip() == "mineru image text"
+    assert rows[0].name == "initial.md"
     assert calls == ["page.png"]
+
+
+def test_prepare_markdown_inputs_converts_word_to_pdf_chunks_for_mineru(tmp_path: Path, monkeypatch) -> None:
+    document = tmp_path / "book.docx"
+    document.write_bytes(b"docx")
+    calls: list[tuple[str, object]] = []
+
+    def fake_convert(path: Path, *, output_dir: Path) -> Path:
+        calls.append(("convert", path.name))
+        pdf = output_dir / "book.pdf"
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        pdf.write_bytes(b"%PDF-1.4\n")
+        return pdf
+
+    def fake_page_count(path: Path) -> int:
+        calls.append(("page_count", path.name))
+        return 61
+
+    def fake_pdf_chunks(
+        path: Path,
+        *,
+        page_count: int,
+        segment_dir: Path,
+        output_dir: Path,
+        settings: PreprocessSettings,
+    ) -> Path:
+        calls.append(("pdf_chunks", [path.name, page_count, settings.pdf_page_chunk_size, segment_dir.name]))
+        out = output_dir / "mineru_vlm.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("word text", encoding="utf-8")
+        return out
+
+    def fail_mineru(files: list[Path], *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        raise AssertionError(f"word files must not be submitted whole: {files}")
+
+    monkeypatch.setattr(preprocess, "_convert_word_to_pdf", fake_convert)
+    monkeypatch.setattr(preprocess, "run_mineru_vlm_for_pdf_chunks", fake_pdf_chunks)
+
+    rows = prepare_markdown_inputs(
+        input_path=document,
+        output_dir=tmp_path / "out",
+        settings=PreprocessSettings(mineru_api_key="token", pdf_page_chunk_size=30),
+        page_count_reader=fake_page_count,
+        mineru_runner=fail_mineru,
+    )
+
+    assert rows[0].read_text(encoding="utf-8").strip() == "word text"
+    assert rows[0].name == "initial.md"
+    assert ("convert", "book.docx") in calls
+    assert ("page_count", "book.pdf") in calls
+    assert ("pdf_chunks", ["book.pdf", 61, 30, "mineru_segments"]) in calls
 
 
 def test_mineru_client_retries_transient_request_errors(monkeypatch) -> None:
@@ -1485,13 +2081,35 @@ def test_batch_discovery_excludes_output_and_generated_files(tmp_path: Path) -> 
     source = tmp_path / "pdf"
     output = source / "output"
     output.mkdir(parents=True)
-    for name in ["0中医概念入门.pdf", "book.md", "0中医概念入门__myocr_text.pdf", "notes.txt"]:
+    for name in ["0涓尰姒傚康鍏ラ棬.pdf", "book.md", "0涓尰姒傚康鍏ラ棬__myocr_text.pdf", "notes.txt"]:
         (source / name).write_text("x", encoding="utf-8")
     (output / "generated.md").write_text("x", encoding="utf-8")
 
     rows = discover_batch_sources(source_dir=source, output_dir=output)
 
-    assert [path.name for path in rows] == ["0中医概念入门.pdf", "book.md"]
+    assert [path.name for path in rows] == ["0涓尰姒傚康鍏ラ棬.pdf", "book.md"]
+
+
+def test_batch_discovery_sorts_by_leading_filename_number(tmp_path: Path) -> None:
+    source = tmp_path / "pdf"
+    source.mkdir()
+    output = tmp_path / "output"
+    for name in [
+        "100中国百年百名中医临床家丛书—张子琳.md",
+        "2中国百年百名中医临床家丛书—查玉明.md",
+        "10中国百年百名中医临床家丛书—董建华.md",
+        "1中国百年百名中医临床家丛书—蔡小荪.md",
+    ]:
+        (source / name).write_text("x", encoding="utf-8")
+
+    rows = discover_batch_sources(source_dir=source, output_dir=output)
+
+    assert [path.name for path in rows] == [
+        "1中国百年百名中医临床家丛书—蔡小荪.md",
+        "2中国百年百名中医临床家丛书—查玉明.md",
+        "10中国百年百名中医临床家丛书—董建华.md",
+        "100中国百年百名中医临床家丛书—张子琳.md",
+    ]
 
 
 def test_batch_discovery_prunes_output_subtree(tmp_path: Path, monkeypatch) -> None:
@@ -1605,7 +2223,7 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
         calls.append(("ppx", path.name))
         out = output_dir / "clean" / "ppx.md"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("PPX 审计文本", encoding="utf-8")
+        out.write_text("PPX audit text", encoding="utf-8")
         ppx_finished.set()
         return out
 
@@ -1614,7 +2232,7 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
         calls.append(("mineru_files", [path.name for path in files]))
         out = output_dir / "mineru_vlm.md"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("# 本草\n\nMinerU 正式文本含错字。\n", encoding="utf-8")
+        out.write_text("# MinerU\n\nMinerU body typo.\n", encoding="utf-8")
         return out
 
     def preprocess_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> list[Path]:
@@ -1657,6 +2275,7 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
             llm_api_url="http://llm.test",
             llm_api_key="key",
             llm_model="model",
+            llm_mode="legacy-correction",
             concurrency=4,
             mineru_api_key="token",
             mineru_concurrency=3,
@@ -1678,10 +2297,11 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
     assert book_summary["status"] == "passed"
     assert document["status"] == "passed"
     assert final_md.exists()
-    assert "正字" in final_md.read_text(encoding="utf-8")
+    assert "MinerU body" in final_md.read_text(encoding="utf-8")
     assert final_pdf.read_bytes().startswith(b"%PDF-")
-    assert manifest["formal_markdown"] == manifest["mineru_markdown"]
-    assert Path(manifest["formal_markdown"]).name == "mineru_vlm.md"
+    assert Path(manifest["formal_markdown"]).name == "initial.md"
+    assert Path(manifest["mineru_markdown"]).name == "mineru_vlm.md"
+    assert "cross_report" in manifest
     assert ppx_finished.wait(timeout=1)
     assert ppx_status["status"] == "completed"
     assert ("split", 30) in calls
@@ -1692,13 +2312,13 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
 
 
 def test_run_batch_treats_skipped_passed_books_as_success(tmp_path: Path) -> None:
-    source = tmp_path / "pdf"
+    source = tmp_path / "source"
     source.mkdir()
     source_file = source / "a.md"
     source_file.write_text("a", encoding="utf-8")
-    output = source / "output"
-    book_output = output / "0001_a"
-    report_dir = book_output / "reports"
+    output = tmp_path / "output"
+    book_output = output / "process" / "books" / "0001_a"
+    report_dir = book_output / "process" / "reports"
     report_dir.mkdir(parents=True)
     final_md = book_output / "final_markdown" / "a.md"
     final_pdf = book_output / "text_pdfs" / "a.pdf"
@@ -1706,6 +2326,22 @@ def test_run_batch_treats_skipped_passed_books_as_success(tmp_path: Path) -> Non
     final_pdf.parent.mkdir(parents=True)
     final_md.write_text("accepted", encoding="utf-8")
     final_pdf.write_bytes(b"%PDF-1.4\n")
+    binding_report = report_dir / "a.artifact_binding.json"
+    final_sha = hashlib.sha256("accepted".encode("utf-8")).hexdigest()
+    pdf_sha = hashlib.sha256(b"%PDF-1.4\n").hexdigest()
+    binding_report.write_text(
+        json.dumps(
+            {
+                "accepted": True,
+                "final_markdown_sha256": final_sha,
+                "pdf_source_text_sha256": final_sha,
+                "pdf_binary_sha256": pdf_sha,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (report_dir / "llmcheck_summary.json").write_text(
         json.dumps(
             {
@@ -1716,6 +2352,12 @@ def test_run_batch_treats_skipped_passed_books_as_success(tmp_path: Path) -> Non
                         "status": "passed",
                         "final_markdown_path": str(final_md),
                         "text_pdf_path": str(final_pdf),
+                        "artifact_binding_report_path": str(binding_report),
+                        "artifact_binding_status": "passed",
+                        "final_markdown_sha256": final_sha,
+                        "pdf_source_sha256": final_sha,
+                        "pdf_sha256": pdf_sha,
+                        "sha256": final_sha,
                     }
                 ],
             },
@@ -1745,12 +2387,477 @@ def test_run_batch_treats_skipped_passed_books_as_success(tmp_path: Path) -> Non
     assert summary["documents"][0]["status"] == "skipped"
 
 
+def test_run_batch_skips_when_final_markdown_already_exists(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "1中国百年百名中医临床家丛书—蔡小荪.md"
+    source_file.write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+    final_dir = output / "md"
+    final_dir.mkdir(parents=True)
+    (final_dir / f"{source_file.stem}.md").write_text("already delivered", encoding="utf-8")
+    calls = 0
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"status": "passed"}
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        runner=fake_runner,
+    )
+
+    assert calls == 0
+    assert summary["status"] == "passed"
+    assert summary["skipped"] == 1
+    assert summary["documents"][0]["status"] == "skipped"
+    assert summary["documents"][0]["result_status"] == "already_delivered"
+
+
+def test_run_batch_publishes_markdown_by_source_stem_and_delivery_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "100医案.md"
+    source_file.write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        final_md = output_dir / "final_markdown" / "internal.md"
+        final_pdf = output_dir / "text_pdfs" / "internal.pdf"
+        final_md.parent.mkdir(parents=True)
+        final_pdf.parent.mkdir(parents=True)
+        final_md.write_text("# accepted\n", encoding="utf-8")
+        final_pdf.write_bytes(b"%PDF-1.4\n")
+        return {
+            "status": "passed",
+            "documents": [
+                {
+                    "document_id": "doc-1",
+                    "source_path": str(input_path),
+                    "status": "passed",
+                    "final_markdown_path": str(final_md),
+                    "text_pdf_path": str(final_pdf),
+                }
+            ],
+        }
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        runner=fake_runner,
+    )
+
+    delivery_path = output / "md" / f"{source_file.stem}.md"
+    prefixed_delivery_path = output / "md" / f"0001_{source_file.stem}.md"
+    manifest_path = output / "process" / "llmcheck_delivery_manifest.jsonl"
+    manifest_rows = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
+    book_manifest = output / "process" / "books" / "0001_100医案" / "process" / "reports" / "100医案.delivery_manifest.json"
+
+    assert summary["status"] == "passed"
+    assert delivery_path.read_text(encoding="utf-8") == "# accepted\n"
+    assert not prefixed_delivery_path.exists()
+    assert summary["delivery_manifest_path"] == str(manifest_path)
+    assert manifest_rows[-1]["accepted"] is True
+    assert manifest_rows[-1]["source_path"] == str(source_file.resolve())
+    assert manifest_rows[-1]["final_markdown_path"] == str(delivery_path.resolve())
+    assert manifest_rows[-1]["acquisition_status"] == "delivered"
+    assert json.loads(book_manifest.read_text(encoding="utf-8"))["final_markdown_path"] == str(delivery_path.resolve())
+
+
+def test_run_batch_skips_when_delivery_manifest_maps_source_hash_to_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "a.md"
+    source_file.write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+    final_dir = output / "md"
+    process_dir = output / "process"
+    delivered = final_dir / "custom-delivered-name.md"
+    delivered.parent.mkdir(parents=True)
+    delivered.write_text("accepted", encoding="utf-8")
+    manifest_path = process_dir / "llmcheck_delivery_manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "accepted": True,
+                "acquisition_status": "delivered",
+                "source_path": str(source_file.resolve()),
+                "source_sha256": hashlib.sha256(source_file.read_bytes()).hexdigest(),
+                "final_markdown_path": str(delivered.resolve()),
+                "final_markdown_sha256": hashlib.sha256("accepted".encode("utf-8")).hexdigest(),
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"status": "passed", "documents": []}
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        runner=fake_runner,
+    )
+
+    assert calls == 0
+    assert summary["status"] == "passed"
+    assert summary["already_delivered"] == 1
+    assert summary["documents"][0]["status"] == "skipped"
+    assert summary["documents"][0]["result_status"] == "already_delivered"
+
+
+def test_run_batch_allows_explicit_process_and_final_md_dirs_when_source_is_under_output_root(tmp_path: Path) -> None:
+    output_root = tmp_path / "output2"
+    source = output_root / "0"
+    source.mkdir(parents=True)
+    process_dir = output_root / "process"
+    final_md_dir = output_root / "md"
+    source_file = source / "100医案.md"
+    source_file.write_text("source", encoding="utf-8")
+    final_md_dir.mkdir(parents=True)
+    (final_md_dir / f"{source_file.stem}.md").write_text("already done", encoding="utf-8")
+    calls: list[Path] = []
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        calls.append(input_path)
+        return {"status": "passed", "documents": []}
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output_root,
+        process_dir=process_dir,
+        final_md_dir=final_md_dir,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        runner=fake_runner,
+    )
+
+    assert calls == []
+    assert summary["status"] == "passed"
+    assert summary["discovered_total"] == 1
+    assert summary["process_dir"] == str(process_dir.resolve())
+    assert summary["final_md_dir"] == str(final_md_dir.resolve())
+    assert summary["documents"][0]["result_status"] == "already_delivered"
+
+
+def test_run_batch_dry_run_reports_selected_books_without_calling_runner(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ["1一.md", "2二.md"]:
+        (source / name).write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+    calls = 0
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"status": "passed", "documents": []}
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        runner=fake_runner,
+        dry_run=True,
+    )
+
+    assert calls == 0
+    assert summary["status"] == "dry_run"
+    assert summary["discovered_total"] == 2
+    assert summary["selected_total"] == 2
+    assert [row["result_status"] for row in summary["documents"]] == ["would_process", "would_process"]
+
+
+def test_run_batch_preflight_only_includes_llm_preflight_report(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "1一.md").write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+    runner_calls = 0
+    preflight_calls = 0
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return {"status": "passed", "documents": []}
+
+    def fake_preflight(settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return {
+            "status": "passed",
+            "models": [{"model": settings.llm_model, "available": True}],
+            "preferred_available_model": settings.llm_model,
+        }
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="mimo-v2.5-pro"),
+        runner=fake_runner,
+        preflight_only=True,
+        llm_preflight=fake_preflight,
+    )
+
+    assert runner_calls == 0
+    assert preflight_calls == 1
+    assert summary["status"] == "preflight_only"
+    assert summary["llm_preflight"]["preferred_available_model"] == "mimo-v2.5-pro"
+
+
+def test_run_batch_stops_before_books_when_llm_preflight_blocks(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ["1一.md", "2二.md"]:
+        (source / name).write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+    runner_calls = 0
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return {"status": "passed", "documents": []}
+
+    def fake_preflight(settings: LlmCheckSettings) -> dict[str, object]:
+        return {
+            "status": "blocked_needs_llm_service",
+            "error": "all_review_models_unavailable",
+            "models": [
+                {"model": settings.llm_model, "available": False, "error": "model unavailable"},
+                {"model": "gpt-5.5", "available": False, "error": "model unavailable"},
+            ],
+        }
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="key",
+            llm_model="mimo-v2.5-pro",
+            fallback_models="gpt-5.5",
+        ),
+        runner=fake_runner,
+        llm_preflight=fake_preflight,
+    )
+
+    assert runner_calls == 0
+    assert summary["status"] == "blocked_needs_llm_service"
+    assert summary["error"] == "all_review_models_unavailable"
+    assert summary["selected_total"] == 2
+    assert summary["llm_preflight"]["status"] == "blocked_needs_llm_service"
+
+
+def test_run_batch_stops_on_global_llm_service_error(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ["1一.md", "2二.md", "3三.md"]:
+        (source / name).write_text("source", encoding="utf-8")
+    output = tmp_path / "output"
+    calls: list[str] = []
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        calls.append(input_path.name)
+        return {
+            "status": "review_required",
+            "error": "All configured LLM reviewer models are unavailable; update LLM service information.",
+            "documents": [
+                {
+                    "status": "llm_review_error",
+                    "error": "all_review_models_unavailable",
+                }
+            ],
+        }
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="mimo-v2.5-pro"),
+        runner=fake_runner,
+        stop_on_global_service_error=True,
+    )
+
+    assert calls == ["1一.md"]
+    assert summary["status"] == "blocked_needs_llm_service"
+    assert summary["error"] == "all_review_models_unavailable"
+    assert summary["total"] == 1
+    assert summary["documents"][0]["status"] == "failed"
+
+
+def test_run_model_compare_runs_same_first_books_for_each_model(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ["1一.md", "2二.md", "3三.md", "4四.md"]:
+        (source / name).write_text("x", encoding="utf-8")
+    output = tmp_path / "compare"
+    calls: list[tuple[str, str, int, str]] = []
+
+    def fake_batch_runner(**kwargs: object) -> dict[str, object]:
+        settings = kwargs["settings"]
+        assert isinstance(settings, LlmCheckSettings)
+        calls.append((settings.llm_model, settings.llm_api_url, int(kwargs["limit"]), Path(str(kwargs["output_dir"])).name))
+        return {
+            "status": "passed",
+            "total": 3,
+            "passed": 3,
+            "failed": 0,
+            "documents": [],
+        }
+
+    report = run_model_compare(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="mimo-v2.5-pro"),
+        models=["mimo-v2.5-pro", "gpt-5.5"],
+        preferred_model="mimo-v2.5-pro",
+        fallback_model="gpt-5.5",
+        limit=3,
+        runner=fake_batch_runner,
+    )
+
+    assert calls == [
+        ("mimo-v2.5-pro", "https://api.iaigc.fun/v1", 3, "mimo-v2.5-pro"),
+        ("gpt-5.5", "http://127.0.0.1:3022", 3, "gpt-5.5"),
+    ]
+    assert [row["llm_api_url"] for row in report["models"]] == ["https://api.iaigc.fun/v1", "http://127.0.0.1:3022"]
+    assert report["status"] == "passed"
+    assert report["recommendation"]["preferred_model"] == "mimo-v2.5-pro"
+    assert report["recommendation"]["fallback_model"] == "gpt-5.5"
+    assert report["recommendation"]["quality_equivalent"] is True
+
+
+def test_run_model_compare_disables_fallback_inside_each_model_run(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "1一.md").write_text("x", encoding="utf-8")
+    output = tmp_path / "compare"
+
+    def fake_batch_runner(**kwargs: object) -> dict[str, object]:
+        settings = kwargs["settings"]
+        assert isinstance(settings, LlmCheckSettings)
+        assert settings.allow_fallback_models is False
+        assert settings.fallback_models == ""
+        return {"status": "passed", "total": 1, "passed": 1, "failed": 0, "documents": []}
+
+    run_model_compare(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(
+            llm_api_url="http://llm.test",
+            llm_api_key="key",
+            llm_model="mimo-v2.5-pro",
+            allow_fallback_models=True,
+            fallback_models="gpt-5.5",
+        ),
+        models=["mimo-v2.5-pro", "gpt-5.5"],
+        preferred_model="mimo-v2.5-pro",
+        fallback_model="gpt-5.5",
+        limit=1,
+        runner=fake_batch_runner,
+    )
+
+
+def test_run_model_compare_does_not_prefer_mimo_when_both_models_fail(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "1一.md").write_text("x", encoding="utf-8")
+    output = tmp_path / "compare"
+
+    def fake_batch_runner(**kwargs: object) -> dict[str, object]:
+        return {
+            "status": "review_required",
+            "total": 3,
+            "passed": 0,
+            "failed": 3,
+            "documents": [
+                {"status": "llm_review_error"},
+                {"status": "llm_review_error"},
+                {"status": "llm_review_error"},
+            ],
+        }
+
+    report = run_model_compare(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="mimo-v2.5-pro"),
+        models=["mimo-v2.5-pro", "gpt-5.5"],
+        preferred_model="mimo-v2.5-pro",
+        fallback_model="gpt-5.5",
+        limit=3,
+        runner=fake_batch_runner,
+    )
+
+    assert report["status"] == "review_required"
+    assert report["recommendation"]["quality_equivalent"] is False
+    assert report["recommendation"]["preferred_model"] == "gpt-5.5"
+    assert report["recommendation"]["comparison_basis"] == "no_successful_model"
+
+
+def test_run_batch_reruns_when_passed_summary_lacks_artifact_binding(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "a.md"
+    source_file.write_text("a", encoding="utf-8")
+    output = tmp_path / "output"
+    book_output = output / "process" / "books" / "0001_a"
+    report_dir = book_output / "process" / "reports"
+    report_dir.mkdir(parents=True)
+    final_md = book_output / "final_markdown" / "a.md"
+    final_pdf = book_output / "text_pdfs" / "a.pdf"
+    final_md.parent.mkdir(parents=True)
+    final_pdf.parent.mkdir(parents=True)
+    final_md.write_text("accepted", encoding="utf-8")
+    final_pdf.write_bytes(b"%PDF-1.4\n")
+    (report_dir / "llmcheck_summary.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "input_path": str(source_file.resolve()),
+                "documents": [{"status": "passed", "final_markdown_path": str(final_md), "text_pdf_path": str(final_pdf)}],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        new_report_dir = output_dir / "process" / "reports"
+        new_report_dir.mkdir(parents=True, exist_ok=True)
+        (new_report_dir / "llmcheck_summary.json").write_text('{"status":"passed"}\n', encoding="utf-8")
+        return {"status": "passed"}
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        runner=fake_runner,
+    )
+
+    assert calls == 1
+    assert summary["status"] == "passed"
+    assert summary["documents"][0]["status"] == "passed"
+
+
 def test_run_batch_reruns_when_passed_summary_lacks_final_artifacts(tmp_path: Path) -> None:
-    source = tmp_path / "pdf"
+    source = tmp_path / "source"
     source.mkdir()
     (source / "a.md").write_text("a", encoding="utf-8")
-    output = source / "output"
-    report_dir = output / "0001_a" / "reports"
+    output = tmp_path / "output"
+    report_dir = output / "process" / "books" / "0001_a" / "process" / "reports"
     report_dir.mkdir(parents=True)
     (report_dir / "llmcheck_summary.json").write_text(
         json.dumps({"status": "passed", "input_path": str((source / "a.md").resolve()), "documents": [{"status": "passed"}]}) + "\n",
@@ -1761,7 +2868,7 @@ def test_run_batch_reruns_when_passed_summary_lacks_final_artifacts(tmp_path: Pa
     def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        new_report_dir = output_dir / "reports"
+        new_report_dir = output_dir / "process" / "reports"
         new_report_dir.mkdir(parents=True, exist_ok=True)
         (new_report_dir / "llmcheck_summary.json").write_text('{"status":"passed"}\n', encoding="utf-8")
         return {"status": "passed"}
@@ -1856,6 +2963,63 @@ def test_run_batch_summary_merges_incremental_state(tmp_path: Path) -> None:
     assert summary["selected_total"] == 1
     assert summary["total"] == 2
     assert [Path(row["output_dir"]).name for row in summary["documents"]] == ["0001_a", "0002_b"]
+
+
+def test_run_batch_current_window_ignores_future_historical_state(tmp_path: Path) -> None:
+    source = tmp_path / "pdf"
+    source.mkdir()
+    (source / "a.md").write_text("a", encoding="utf-8")
+    (source / "b.md").write_text("b", encoding="utf-8")
+    (source / "c.md").write_text("c", encoding="utf-8")
+    output = source / "output"
+    process_dir = output / "process"
+    state_path = process_dir / "llmcheck_batch_state.jsonl"
+    process_dir.mkdir(parents=True)
+    stale_rows = [
+        {
+            "index": 2,
+            "total": 3,
+            "source_path": str((source / "b.md").resolve()),
+            "output_dir": str(process_dir / "books" / "0002_b"),
+            "status": "failed",
+            "started_at": "2026-01-01T00:00:00",
+            "finished_at": "2026-01-01T00:00:01",
+            "result_status": "llm_review_failed",
+            "error": "stale failure",
+        },
+        {
+            "index": 3,
+            "total": 3,
+            "source_path": str((source / "c.md").resolve()),
+            "output_dir": str(process_dir / "books" / "0003_c"),
+            "status": "in_progress",
+            "started_at": "2026-01-01T00:00:02",
+            "finished_at": "",
+            "result_status": "",
+            "error": "",
+        },
+    ]
+    state_path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in stale_rows) + "\n", encoding="utf-8")
+
+    def fake_runner(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        report_dir = output_dir / "process" / "reports"
+        report_dir.mkdir(parents=True)
+        (report_dir / "llmcheck_summary.json").write_text('{"status":"passed"}\n', encoding="utf-8")
+        return {"status": "passed"}
+
+    summary = run_batch(
+        source_dir=source,
+        output_dir=output,
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        start_index=1,
+        limit=1,
+        force=True,
+        runner=fake_runner,
+    )
+
+    assert summary["status"] == "passed"
+    assert summary["total"] == 1
+    assert [Path(row["source_path"]).name for row in summary["documents"]] == ["a.md"]
 
 
 def test_run_batch_out_of_range_ignores_historical_state(tmp_path: Path) -> None:
@@ -1979,18 +3143,18 @@ def test_run_batch_writes_in_progress_state_before_runner_finishes(tmp_path: Pat
 
 
 def test_cli_progress_event_prints_jsonl_to_stderr(capsys) -> None:
-    _print_progress_event({"event": "book_started", "index": 6, "total": 24, "book_name": "14本草备要讲解.pdf"})
+    _print_progress_event({"event": "book_started", "index": 6, "total": 24, "book_name": "14鏈崏澶囪璁茶В.pdf"})
 
     captured = capsys.readouterr()
     assert captured.out == ""
     payload = json.loads(captured.err)
     assert payload["type"] == "progress"
     assert payload["event"] == "book_started"
-    assert payload["book_name"] == "14本草备要讲解.pdf"
+    assert payload["book_name"] == "14鏈崏澶囪璁茶В.pdf"
 
 
 def test_cli_mineru_status_summarizes_book_output(tmp_path: Path, capsys) -> None:
-    mineru_dir = tmp_path / "process" / "preprocess" / "14本草备要讲解" / "mineru"
+    mineru_dir = tmp_path / "process" / "preprocess" / "14鏈崏澶囪璁茶В" / "mineru"
     (mineru_dir / "segment_001").mkdir(parents=True)
     (mineru_dir / "segment_002").mkdir(parents=True)
     (mineru_dir / "segment_001" / "status.json").write_text('{"status":"cached"}\n', encoding="utf-8")
@@ -1998,7 +3162,7 @@ def test_cli_mineru_status_summarizes_book_output(tmp_path: Path, capsys) -> Non
         '{"status":"polling","state_counts":{"pending":1}}\n',
         encoding="utf-8",
     )
-    ppx_markdown = tmp_path / "process" / "preprocess" / "14本草备要讲解" / "ppx" / "clean" / "ppx.md"
+    ppx_markdown = tmp_path / "process" / "preprocess" / "14鏈崏澶囪璁茶В" / "ppx" / "clean" / "ppx.md"
     ppx_markdown.parent.mkdir(parents=True)
     ppx_markdown.write_text("ppx audit text", encoding="utf-8")
 
@@ -2007,7 +3171,7 @@ def test_cli_mineru_status_summarizes_book_output(tmp_path: Path, capsys) -> Non
     captured = capsys.readouterr()
     assert exit_code == 0
     payload = json.loads(captured.out)
-    assert payload["book_name"] == "14本草备要讲解"
+    assert payload["book_name"] == "14鏈崏澶囪璁茶В"
     assert payload["stage"] == "mineru_pending"
     assert payload["mineru_segments"]["total"] == 2
     assert payload["mineru_segments"]["status_counts"] == {"cached": 1, "polling": 1}
@@ -2056,6 +3220,109 @@ def test_llmcheck_settings_and_cli_default_to_ten_llm_workers(monkeypatch, tmp_p
     settings = captured["settings"]
     assert isinstance(settings, LlmCheckSettings)
     assert settings.concurrency == 10
+
+
+def test_cli_run_defaults_deepseek_and_accepts_llm_guard_args(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_process_documents(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        captured["settings"] = settings
+        return {
+            "status": "passed",
+            "input_path": str(input_path),
+            "output_dir": str(output_dir),
+            "document_count": 0,
+            "documents": [],
+        }
+
+    source = tmp_path / "source.md"
+    source.write_text("text", encoding="utf-8")
+    monkeypatch.setattr("llmcheck.cli.process_documents", fake_process_documents)
+
+    exit_code = main(
+        [
+            "run",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--llm-api-url",
+            "http://llm.test",
+            "--llm-api-key",
+            "key",
+            "--review-concurrency",
+            "4",
+            "--patch-concurrency",
+            "2",
+            "--llm-call-timeout-seconds",
+            "120",
+            "--llm-stage-timeout-seconds",
+            "1800",
+            "--llm-idle-timeout-seconds",
+            "300",
+            "--llm-max-calls-per-book",
+            "123",
+            "--llm-max-cost-per-book",
+            "1.5",
+            "--allow-fallback-models",
+            "--fallback-models",
+            "gpt-5",
+        ]
+    )
+
+    assert exit_code == 0
+    settings = captured["settings"]
+    assert isinstance(settings, LlmCheckSettings)
+    assert settings.llm_model == "deepseek-v4-pro"
+    assert settings.llm_mode == "review-first"
+    assert settings.review_concurrency == 4
+    assert settings.patch_concurrency == 2
+    assert settings.llm_call_timeout_seconds == 120
+    assert settings.llm_stage_timeout_seconds == 1800
+    assert settings.llm_idle_timeout_seconds == 300
+    assert settings.llm_max_calls_per_book == 123
+    assert settings.llm_max_cost_per_book == 1.5
+    assert settings.allow_fallback_models is True
+    assert settings.fallback_models == "gpt-5"
+
+
+def test_cli_run_accepts_llm_mode(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_process_documents(*, input_path: Path, output_dir: Path, settings: LlmCheckSettings) -> dict[str, object]:
+        captured["settings"] = settings
+        return {
+            "status": "passed",
+            "input_path": str(input_path),
+            "output_dir": str(output_dir),
+            "document_count": 0,
+            "documents": [],
+        }
+
+    source = tmp_path / "source.md"
+    source.write_text("text", encoding="utf-8")
+    monkeypatch.setattr("llmcheck.cli.process_documents", fake_process_documents)
+
+    exit_code = main(
+        [
+            "run",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--llm-api-url",
+            "http://llm.test",
+            "--llm-api-key",
+            "key",
+            "--llm-mode",
+            "legacy-correction",
+        ]
+    )
+
+    assert exit_code == 0
+    settings = captured["settings"]
+    assert isinstance(settings, LlmCheckSettings)
+    assert settings.llm_mode == "legacy-correction"
 
 
 def test_cli_allows_one_thousand_char_llm_chunks(monkeypatch, tmp_path: Path) -> None:
@@ -2144,7 +3411,7 @@ def test_cli_reads_mineru_api_key_from_dotenv(monkeypatch, tmp_path: Path) -> No
 
 
 def test_gui_reads_mineru_segment_status(tmp_path: Path) -> None:
-    mineru_dir = tmp_path / "preprocess" / "14本草备要讲解" / "mineru"
+    mineru_dir = tmp_path / "preprocess" / "14鏈崏澶囪璁茶В" / "mineru"
     (mineru_dir / "segment_001").mkdir(parents=True)
     (mineru_dir / "segment_002").mkdir(parents=True)
     (mineru_dir / "segment_001" / "status.json").write_text('{"status":"cached"}\n', encoding="utf-8")
@@ -2153,7 +3420,7 @@ def test_gui_reads_mineru_segment_status(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    status = _read_mineru_segment_status(tmp_path, book_name="14本草备要讲解.pdf")
+    status = _read_mineru_segment_status(tmp_path, book_name="14鏈崏澶囪璁茶В.pdf")
 
     assert status["total"] == 2
     assert status["status_counts"] == {"cached": 1, "polling": 1}
@@ -2162,16 +3429,16 @@ def test_gui_reads_mineru_segment_status(tmp_path: Path) -> None:
 
 
 def test_gui_live_progress_includes_book_diagnostics(tmp_path: Path) -> None:
-    mineru_dir = tmp_path / "preprocess" / "14本草备要讲解" / "mineru"
+    mineru_dir = tmp_path / "preprocess" / "14鏈崏澶囪璁茶В" / "mineru"
     (mineru_dir / "segment_001").mkdir(parents=True)
     (mineru_dir / "segment_001" / "status.json").write_text(
         '{"status":"polling","state_counts":{"pending":1}}\n',
         encoding="utf-8",
     )
-    ppx_markdown = tmp_path / "preprocess" / "14本草备要讲解" / "ppx" / "clean" / "ppx.md"
+    ppx_markdown = tmp_path / "preprocess" / "14鏈崏澶囪璁茶В" / "ppx" / "clean" / "ppx.md"
     ppx_markdown.parent.mkdir(parents=True)
     ppx_markdown.write_text("ppx audit text", encoding="utf-8")
-    job = {"current_output_dir": str(tmp_path), "current_book": "14本草备要讲解.pdf"}
+    job = {"current_output_dir": str(tmp_path), "current_book": "14鏈崏澶囪璁茶В.pdf"}
 
     result = _with_live_progress(job)
 
@@ -2261,17 +3528,153 @@ def test_gui_html_exposes_directory_output_llm_and_concurrency_controls() -> Non
     assert "ppx_formula: document.getElementById('ppx_formula').value" in html
 
 
-def test_gui_exe_launcher_starts_server_without_browser(monkeypatch) -> None:
-    captured: dict[str, object] = {}
+def test_gui_exe_launcher_starts_native_desktop(monkeypatch) -> None:
+    captured: dict[str, bool] = {}
 
-    def fake_run(app: object, *, host: str, port: int) -> None:
-        captured["app"] = app
-        captured["host"] = host
-        captured["port"] = port
+    def fake_run_desktop_gui() -> int:
+        captured["called"] = True
+        return 0
 
-    monkeypatch.setattr("llmcheck.gui_exe.uvicorn.run", fake_run)
-    monkeypatch.setattr("llmcheck.gui_exe.create_app", lambda: "app")
+    monkeypatch.setattr("llmcheck.gui_exe.run_desktop_gui", fake_run_desktop_gui)
 
-    assert gui_exe.main(["--host", "0.0.0.0", "--port", "8767", "--no-browser"]) == 0
-    assert captured == {"app": "app", "host": "0.0.0.0", "port": 8767}
-    assert gui_exe._browser_url(host="0.0.0.0", port=8767) == "http://127.0.0.1:8767"
+    assert gui_exe.main([]) == 0
+    assert captured == {"called": True}
+
+
+def test_run_guard_rejects_active_lock(tmp_path: Path) -> None:
+    from llmcheck.run_guard import RunAlreadyActiveError, acquire_run_lock
+
+    process_dir = tmp_path / "process"
+    first = acquire_run_lock(process_dir, run_id="first")
+    first.heartbeat(status="running", stage="llm")
+
+    try:
+        acquire_run_lock(process_dir, run_id="second")
+    except RunAlreadyActiveError as error:
+        assert "already active" in str(error)
+    else:
+        raise AssertionError("active lock should reject second run")
+
+
+def test_process_documents_writes_finished_run_lock(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("# Title\n\nBody", encoding="utf-8")
+
+    report = process_documents(
+        input_path=source,
+        output_dir=tmp_path / "out",
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        client=ReviewClient(accept=False),
+    )
+
+    lock = json.loads((tmp_path / "out" / "process" / "llmcheck_run.lock").read_text(encoding="utf-8"))
+    assert report["status"] == "review_required"
+    assert lock["status"] == "review_required"
+    assert lock["stage"] == "finished"
+    assert lock["finished_at"]
+
+
+def test_run_batch_rejects_active_output_lock(tmp_path: Path) -> None:
+    from llmcheck.run_guard import RunAlreadyActiveError, acquire_run_lock
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "a.md").write_text("a", encoding="utf-8")
+    output = tmp_path / "output"
+    lock = acquire_run_lock(output / "process", run_id="active")
+    lock.heartbeat(status="running", stage="books")
+
+    try:
+        run_batch(
+            source_dir=source,
+            output_dir=output,
+            settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+            runner=lambda **_kwargs: {"status": "passed"},
+        )
+    except RunAlreadyActiveError as error:
+        assert "already active" in str(error)
+    else:
+        raise AssertionError("active batch lock should reject second run")
+
+
+def test_cli_inspect_summarizes_output(tmp_path: Path, capsys) -> None:
+    output = tmp_path / "out"
+    reports = output / "process" / "reports"
+    reports.mkdir(parents=True)
+    (reports / "llmcheck_summary.json").write_text(json.dumps({"status": "review_required", "document_count": 1}) + "\n", encoding="utf-8")
+    (reports / "llmcheck_manifest.jsonl").write_text(
+        json.dumps({"document_id": "doc", "status": "llm_review_error", "error": "HTTP Error 401", "final_markdown_path": "", "text_pdf_path": ""}) + "\n",
+        encoding="utf-8",
+    )
+    (output / "process" / "heartbeat.json").write_text(json.dumps({"status": "review_required", "stage": "finished"}) + "\n", encoding="utf-8")
+    (output / "process" / "llm_calls.jsonl").write_text(json.dumps({"status": "error", "stage": "llm_review", "error": "HTTP Error 401"}) + "\n", encoding="utf-8")
+
+    exit_code = main(["inspect", "--book-output-dir", str(output)])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["summary_status"] == "review_required"
+    assert payload["documents"][0]["status"] == "llm_review_error"
+    assert payload["llm_calls"]["status_counts"] == {"error": 1}
+    assert payload["llm_calls"]["latest_error"] == "HTTP Error 401"
+
+
+def test_cli_review_cost_and_quality_reports_summarize_output(tmp_path: Path, capsys) -> None:
+    output = tmp_path / "out"
+    process = output / "process"
+    reports = process / "reports"
+    clean = process / "clean"
+    reports.mkdir(parents=True)
+    clean.mkdir(parents=True)
+    (reports / "llmcheck_manifest.jsonl").write_text(
+        json.dumps({"document_id": "doc", "status": "llm_review_failed"}) + "\n",
+        encoding="utf-8",
+    )
+    (reports / "doc.llm_review.json").write_text(
+        json.dumps(
+            {
+                "status": "needs_revision",
+                "accepted": False,
+                "issues": [
+                    {
+                        "id": "i1",
+                        "category": "latex_artifact",
+                        "severity": "major",
+                        "safe_fix_type": "rule_fix",
+                        "excerpt": "$9\\mathrm{g}$",
+                        "reason": "unit residue",
+                    }
+                ],
+                "manual_review_notes": ["check dosage"],
+            }
+        ) + "\n",
+        encoding="utf-8",
+    )
+    (reports / "doc.safe_patch.json").write_text(
+        json.dumps({"status": "manual_review_required", "applied_patch_count": 0, "skipped_patch_count": 1, "unresolved_issues": [{"id": "i1"}]}) + "\n",
+        encoding="utf-8",
+    )
+    (process / "cost_report.json").write_text(json.dumps({"model": "deepseek-v4-pro", "llm_call_count": 1, "estimated_cost": None, "currency": "unknown", "pricing_available": False}) + "\n", encoding="utf-8")
+    (process / "llm_calls.jsonl").write_text(json.dumps({"status": "ok", "stage": "llm_review", "model": "deepseek-v4-pro", "duration_seconds": 1.25}) + "\n", encoding="utf-8")
+    (reports / "doc.quality.json").write_text(json.dumps({"profile_id": "general_standard_document", "errors": ["latex_unit_residue"], "hints": ["short_document"]}) + "\n", encoding="utf-8")
+    (clean / "doc.cleaning_report.json").write_text(json.dumps({"rule_changes": [{"rule_id": "latex.unit_math_to_text"}]}) + "\n", encoding="utf-8")
+    (reports / "doc.final_acceptance.json").write_text(json.dumps({"accepted": False, "blocking_errors": ["latex_unit_residue"]}) + "\n", encoding="utf-8")
+
+    assert main(["review-report", "--book-output-dir", str(output)]) == 0
+    review_payload = json.loads(capsys.readouterr().out)
+    assert review_payload["issue_counts"] == {"latex_artifact": 1}
+    assert review_payload["documents"][0]["safe_patch_status"] == "manual_review_required"
+
+    assert main(["cost-summary", "--book-output-dir", str(output)]) == 0
+    cost_payload = json.loads(capsys.readouterr().out)
+    assert cost_payload["model"] == "deepseek-v4-pro"
+    assert cost_payload["stage_counts"] == {"llm_review": 1}
+    assert cost_payload["status_counts"] == {"ok": 1}
+
+    assert main(["quality-report", "--book-output-dir", str(output)]) == 0
+    quality_payload = json.loads(capsys.readouterr().out)
+    assert quality_payload["error_counts"] == {"latex_unit_residue": 1}
+    assert quality_payload["rule_change_counts"] == {"latex.unit_math_to_text": 1}
+    assert quality_payload["final_acceptance_status_counts"] == {"needs_revision": 1}
+

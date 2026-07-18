@@ -81,6 +81,7 @@ def test_process_documents_records_profile_and_final_reports(tmp_path: Path, mon
             llm_api_url="http://llm.test",
             llm_api_key="key",
             llm_model="model",
+            llm_mode="legacy-correction",
             profile_id="technical_manual",
         ),
         client=ProfilePipelineClient(),
@@ -103,7 +104,7 @@ def test_process_documents_blocks_final_output_when_final_acceptance_fails(tmp_p
     report = process_documents(
         input_path=source,
         output_dir=tmp_path / "out",
-        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model"),
+        settings=LlmCheckSettings(llm_api_url="http://llm.test", llm_api_key="key", llm_model="model", llm_mode="legacy-correction"),
         client=ProfilePipelineClient(corrected_text="这是锟斤拷文本。\n"),
     )
 
@@ -111,6 +112,10 @@ def test_process_documents_blocks_final_output_when_final_acceptance_fails(tmp_p
     assert report["status"] == "review_required"
     assert row["status"] == "final_acceptance_failed"
     assert row["final_markdown_path"] == ""
+    assert row["text_pdf_path"] == ""
+    assert row["artifact_binding_report_path"] == ""
+    assert row["artifact_binding_status"] == "failed"
+    assert Path(row["final_acceptance_report_path"]).exists()
     assert not list((tmp_path / "out" / "md").glob("*.md"))
 
 

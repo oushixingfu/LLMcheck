@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 import unicodedata
 
+PdfLine = tuple[str, int]
+
 
 def write_text_pdf(
     path: Path,
@@ -14,7 +16,7 @@ def write_text_pdf(
     lines_per_page: int = 44,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = _paginate_lines(text, chars_per_line=chars_per_line)
+    lines = _paginate_pdf_lines(text, chars_per_line=chars_per_line)
     pages = [lines[index : index + lines_per_page] for index in range(0, len(lines), lines_per_page)] or [[]]
     objects: list[bytes] = []
 
@@ -63,6 +65,37 @@ def write_text_pdf(
     _write_pdf_objects(path, objects)
 
 
+def _plain_text_for_pdf(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in re.sub(r"\r\n?", "\n", text).split("\n"):
+        content, _level = _pdf_line_text_and_level(raw_line)
+        lines.append(content)
+    return "\n".join(lines)
+
+
+def _paginate_pdf_lines(text: str, *, chars_per_line: int) -> list[PdfLine]:
+    normalized = re.sub(r"\r\n?", "\n", text).strip()
+    result: list[PdfLine] = []
+    for raw_line in normalized.split("\n"):
+        line, level = _pdf_line_text_and_level(raw_line.rstrip())
+        if not line:
+            result.append(("", 0))
+            continue
+        while _display_width(line) > chars_per_line:
+            head = _take_display_width(line, chars_per_line)
+            result.append((head.rstrip(), level))
+            line = line[len(head) :]
+        result.append((line, level))
+    return result or [("", 0)]
+
+
+def _pdf_line_text_and_level(raw_line: str) -> PdfLine:
+    heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", raw_line)
+    if heading:
+        return heading.group(2), len(heading.group(1))
+    return raw_line, 0
+
+
 def _paginate_lines(text: str, *, chars_per_line: int) -> list[str]:
     normalized = re.sub(r"\r\n?", "\n", text).strip()
     result: list[str] = []
@@ -79,12 +112,13 @@ def _paginate_lines(text: str, *, chars_per_line: int) -> list[str]:
     return result or [""]
 
 
-def _page_content(*, title: str, page_number: int, page_count: int, lines: list[str]) -> bytes:
+def _page_content(*, title: str, page_number: int, page_count: int, lines: list[PdfLine]) -> bytes:
     commands = ["BT", "/F1 11 Tf", "15 TL"]
     header = f"{title}  第 {page_number}/{page_count} 页"
     commands.append(f"1 0 0 1 54 796 Tm {_pdf_hex_text(header)} Tj")
     y = 764
-    for line in lines:
+    for line, heading_level in lines:
+        commands.append(f"/F1 {_font_size_for_line(heading_level)} Tf")
         commands.append(f"1 0 0 1 54 {y} Tm {_pdf_hex_text(line)} Tj")
         y -= 16
     commands.append("ET")
@@ -113,6 +147,16 @@ def _write_pdf_objects(path: Path, objects: list[bytes]) -> None:
 
 def _pdf_hex_text(value: str) -> str:
     return "<" + value.encode("utf-16-be", errors="ignore").hex().upper() + ">"
+
+
+def _font_size_for_line(heading_level: int) -> int:
+    if heading_level == 1:
+        return 15
+    if heading_level == 2:
+        return 13
+    if heading_level == 3:
+        return 12
+    return 11
 
 
 def _display_width(value: str) -> int:

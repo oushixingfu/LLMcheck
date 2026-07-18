@@ -337,7 +337,7 @@ __PROFILE_OPTIONS__
     <label for="llm_api_key">LLM API Key</label>
     <input id="llm_api_key" type="text" value="123" />
     <label for="llm_model">Model</label>
-    <input id="llm_model" value="gpt-5.5" />
+    <input id="llm_model" value="deepseek-v4-pro" />
     <label for="concurrency">并发上限</label>
     <input id="concurrency" type="number" min="1" value="4" />
     <label for="book_concurrency">逐本并发上限</label>

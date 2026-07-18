@@ -1,0 +1,315 @@
+{
+    "schema":  "llmcheck.local_gate_run_index.v1",
+    "updated_at":  "2026-06-16T05:24:44+08:00",
+    "purpose":  "Recovery anchor for the one-book-at-a-time local-gate run. Read this file after compaction before deciding which book to run next.",
+    "project":  {
+                    "cwd":  "D:\\codex\\LLMcheck",
+                    "project_agents_file":  "D:\\codex\\LLMcheck\\AGENTS.md",
+                    "project_agents_file_exists":  true,
+                    "active_project_instructions_source":  "D:\\codex\\LLMcheck\\AGENTS.md plus latest user instruction"
+                },
+    "corpus":  {
+                   "source_dir":  "D:\\pdf\\output2\\0",
+                   "output_dir":  "D:\\pdf\\output2",
+                   "final_md_dir":  "D:\\pdf\\output2\\md",
+                   "process_dir":  "D:\\pdf\\output2\\process",
+                   "discovered_total":  112
+               },
+    "workflow":  {
+                     "mode":  "local-gate",
+                     "book_concurrency":  1,
+                     "run_foreground_only":  true,
+                     "do_not_leave_background_processes":  true,
+                     "primary_goal":  "Strengthen deterministic pre-LLM cleaning and validation; do not rely on LLM for large-scale validation gates.",
+                     "before_continue_checks":  [
+                                                    "Read D:\\codex\\LLMcheck\\AGENTS.md.",
+                                                    "Read this index.",
+                                                    "Check for residual python.exe processes whose command line contains llmcheck, D:\\pdf\\output2, or pytest.",
+                                                    "Run exactly one book at a time with --book-concurrency 1.",
+                                                    "After each successful full run and verification, update this index before advancing."
+                                                ]
+                 },
+    "checkpoint":  {
+                       "verified_through_index":  112,
+                       "verified_through_source_stem":  "111",
+                       "next_index":  null,
+                       "next_source_stem":  null,
+                       "audit_direction":  "current_final_gate_regression_ascending_one_book_at_a_time",
+                       "audit_reason":  "Current final-gate audit found older delivered Markdown files are stale under the latest rules. The active ascending repair pass has now verified all 112 discovered books under the current full local-gate contract.",
+                       "last_verified_evidence":  {
+                                                      "pre_llm_gate_accepted":  true,
+                                                      "final_acceptance_accepted":  true,
+                                                      "llm_call_bytes":  0,
+                                                      "markdown_heading_count":  194,
+                                                      "toc_heading_count":  1,
+                                                      "nonstandard_heading_count":  0,
+                                                      "typical_residue_patterns":  0,
+                                                      "forced_line_break_candidates":  0,
+                                                      "first_heading_line":  1,
+                                                      "residual_python_tasks":  0
+                                                  },
+                       "last_verified_index":  112,
+                       "last_verified_source_stem":  "111"
+                   },
+    "full_corpus_verification":  {
+                                     "verified_at":  "2026-06-16T05:24:44+08:00",
+                                     "mode":  "read_only_current_final_gate_recheck",
+                                     "source_count":  112,
+                                     "final_md_count":  112,
+                                     "process_book_count":  112,
+                                     "verified_latest_state_rows":  112,
+                                     "failure_count":  0,
+                                     "llm_call_bytes_total":  0,
+                                     "heading_total":  32109,
+                                     "failures_preview":  []
+                                 },
+    "last_run":  {
+                     "index":  112,
+                     "source_stem":  "111",
+                     "command_exit_code":  0,
+                     "batch_status":  "selected_book_passed",
+                     "batch_started_at":  "2026-06-16T05:13:44+08:00",
+                     "batch_finished_at":  "2026-06-16T05:13:47+08:00",
+                     "batch_summary_json_ok":  true,
+                     "quality_pre_llm_accepted":  true,
+                     "quality_errors_len":  0,
+                     "final_acceptance_accepted":  true,
+                     "final_errors_len":  0,
+                     "llm_call_bytes":  0,
+                     "forced_line_break_blocking_hits":  0,
+                     "markdown_heading_count":  194,
+                     "toc_heading_count":  1,
+                     "nonstandard_heading_count":  0,
+                     "typical_residue_hit_patterns":  0,
+                     "first_heading_line":  1,
+                     "residual_python_tasks":  0,
+                     "log_path":  "not captured to a standalone log file; foreground command output and per-book process reports confirmed the run",
+                     "focused_tests":  "python -m pytest tests/test_quality_finalization.py tests/test_latex_unit_cleanup.py -q",
+                     "focused_tests_result":  "not rerun for index 112; no new deterministic rule issue after the index 86 focused run (111 passed in 0.27s)",
+                     "cleaning_fix":  "No new deterministic rule issue for source 111/index 112 (邹云翔). Reran source 111/index 112 with --book-concurrency 1 and --llm-mode local-gate; batch status passed and generated the previously missing final Markdown. Independent verification found pre-LLM and final gates accepted, current code rerun final gate accepted, zero quality/final errors, zero LLM calls, first nonblank line # 出版者的话, one TOC heading, 194 Markdown headings, no true typical metadata residue, no LaTeX residue including \\frac, no final-gate TOC page-heading residue, no nonstandard headings, and no forced-line-break candidates."
+                 },
+    "recent_fixes":  [
+                         {
+                             "index":  86,
+                             "type":  "toc_declared_body_parenthetical_heading_false_positive",
+                             "summary":  "Allow body headings with parenthetical case numbers when the same heading is declared in the TOC, covering # 太阴水血停留（1） and # 太少二阴合病 (2), while preserving true TOC page-heading residue blocking. Reran source 85 with final accepted, zero LLM calls, one TOC heading, 111 Markdown headings, zero true typical/LaTeX/TOC-page/nonstandard/forced-line-break residue, and focused tests 111 passed."
+                         },
+                         {
+                             "index":  81,
+                             "type":  "journal_volume_issue_page_citation_false_positive",
+                             "summary":  "Allow numbered journal bibliography headings with journal year, volume(issue), and page, such as 中级医刊, 1990, 25(5): 62, without weakening TOC page-heading residue blocking. Reran source 80 with final accepted, zero LLM calls, one TOC heading, zero typical/LaTeX/TOC page-heading/nonstandard-dosage/forced-line-break residue, and focused tests 110 passed."
+                         },
+                         {
+                             "index":  77,
+                             "type":  "final_toc_convergence_and_dosage_heading_repromotion",
+                             "summary":  "Run final TOC convergence after duplicate trailing TOC outline removal so TOC tails such as \u0027年谱 (405)\u0027 are demoted back to list entries, and prevent bare dosage formula lines such as \u0027(2）紫硝砂 9g 紫金锭 30g\u0027 from being re-promoted to headings. Reran source 76 with final accepted, zero LLM calls, one TOC heading, zero TOC page-heading/nonstandard-dosage/LaTeX/forced-line-break residue, and focused tests 109 passed."
+                         },
+                         {
+                             "index":  74,
+                             "type":  "preface_image_latex_formula_heading_noise",
+                             "summary":  "Remove short LaTeX formula OCR headings and standalone numeric page headings inside preface image caption segments, covering \u0027# \\\\therefore m = 3/11 ;\u0027 with surrounding \u0027# 6\u0027 and \u0027# 2\u0027. Reran source 73 with final accepted, zero LLM calls, one TOC heading, zero typical/LaTeX/numeric-heading/forced-line-break residue, and focused tests 107 passed."
+                         },
+                         {
+                             "index":  55,
+                             "type":  "preface_image_ocr_heading_and_vertical_series_catalog",
+                             "summary":  "Remove short digit-bearing OCR fake headings in front image-caption segments and trailing vertical series author catalogs after # （按姓氏笔画排列）. Reran source 54 with final accepted, zero LLM calls, one TOC heading, zero typical/LaTeX/forced-line-break residue, and focused tests 106 passed."
+                         },
+                         {
+                             "index":  50,
+                             "type":  "embedded_series_title_page_after_front_matter",
+                             "summary":  "Remove embedded 中国百年百名中医临床家丛书 title-page residue after # 出版者的话 while preserving the real tribute heading and 内容提要; protect long surname-order catalogs for the existing catalog cleanup path. Reran source 49 with final accepted, zero LLM calls, one TOC heading, and zero typical/LaTeX/forced-line-break residue."
+                         },
+                         {
+                             "index":  44,
+                             "type":  "editorial_unit_title_page_prefix",
+                             "summary":  "Treat editorial unit headings such as 广州中医药大学温病学教研室编 as title-page front matter before reliable front matter; reran source 43 with first heading \u0027# 出版者的话\u0027, final accepted, zero LLM calls, and zero typical residue."
+                         },
+                         {
+                             "index":  30,
+                             "type":  "final_clean_heading_renormalization",
+                             "summary":  "Run heading normalization again after final clean_markdown_text so demoted dosage/prescription list lines are not re-promoted to Markdown headings."
+                         },
+                         {
+                             "index":  29,
+                             "type":  "series_catalog_before_normalized_toc",
+                             "summary":  "Run series-catalog-before-TOC cleanup again after TOC normalization so unheaded TOC insertion cannot leave early surname-order catalogs behind."
+                         },
+                         {
+                             "index":  24,
+                             "type":  "trailing_publication_metadata_noise",
+                             "summary":  "Remove late trailing CIP/publication metadata blocks with cover OCR or late TOC signals before pre-LLM gate."
+                         },
+                         {
+                             "index":  23,
+                             "type":  "inline_series_catalog_year_heading_repeat_marker",
+                             "summary":  "Remove inline surname-order trailing series catalogs, allow reading-plan year headings, and avoid duplicate-line false positives on standalone list markers."
+                         },
+                         {
+                             "index":  21,
+                             "type":  "temperature_percent_context",
+                             "summary":  "Keep outcome or lab percentages while still converting true temperature OCR percent artifacts."
+                         },
+                         {
+                             "index":  25,
+                             "type":  "latex_array_residue",
+                             "summary":  "Normalize short LaTeX array residue to ordinary text before pre-LLM gate."
+                         },
+                         {
+                             "index":  26,
+                             "type":  "forced_line_break",
+                             "summary":  "Merge OCR-split inline body-part labels."
+                         },
+                         {
+                             "index":  27,
+                             "type":  "embedded_math_noise",
+                             "summary":  "Remove short embedded foreign math OCR noise before pre-LLM gate."
+                         },
+                         {
+                             "index":  31,
+                             "type":  "latex_slanted_comparison_symbols",
+                             "summary":  "Normalize \\geqslant and \\leqslant to ordinary comparison symbols before pre-LLM gate."
+                         },
+                         {
+                             "index":  45,
+                             "type":  "latex_dosage_symbol_residue",
+                             "summary":  "Normalize \\mathbf dosage commands and OCR substitutions such as \\varrho_g even when OCR glues the dosage unit directly to following Chinese text; reran source 44 with final accepted, zero LLM calls, and zero LaTeX residue."
+                         },
+                         {
+                             "index":  48,
+                             "type":  "latex_footnote_symbol_residue",
+                             "summary":  "Normalize \\clubsuit footnote markers before pre-LLM gate."
+                         },
+                         {
+                             "index":  65,
+                             "type":  "replacement_char_and_latex_star_residue",
+                             "summary":  "Remove isolated Unicode replacement characters and normalize \\star list markers before pre-LLM gate."
+                         },
+                         {
+                             "index":  67,
+                             "type":  "latex_zeta_and_forced_line_break_gate",
+                             "summary":  "Normalize \\zeta dosage residue, merge blank-separated medical word splits, and avoid forced-line-break blocking when candidate detection finds no true adjacent break."
+                         },
+                         {
+                             "index":  68,
+                             "type":  "latex_half_fraction_and_triangle_residue",
+                             "summary":  "Normalize 4\\frac12 needle-gauge residue and \\triangle list markers before pre-LLM gate."
+                         },
+                         {
+                             "index":  72,
+                             "type":  "menstrual_fraction_shorthand_residue",
+                             "summary":  "Normalize gynecology menstrual-cycle \\frac shorthand variants before pre-LLM gate."
+                         },
+                         {
+                             "index":  73,
+                             "type":  "latex_eye_notation_and_theta_residue",
+                             "summary":  "Normalize \\odot ophthalmology notation, \\Theta heading markers, and numeric ^° residue before pre-LLM gate."
+                         },
+                         {
+                             "index":  80,
+                             "type":  "menstrual_fraction_shorthand_without_age_residue",
+                             "summary":  "Normalize no-age gynecology menstrual-cycle \\frac shorthand variants such as 3~6/20~21 and 5/40~60 before pre-LLM gate."
+                         },
+                         {
+                             "index":  91,
+                             "type":  "latex_dot_dosage_residue",
+                             "summary":  "Normalize \\dot dosage residue such as \\dot9g to plain dosage text before pre-LLM gate."
+                         },
+                         {
+                             "index":  100,
+                             "type":  "trailing_archive_metadata_residue",
+                             "summary":  "Remove trailing Anna\u0027s Archive / PDG metadata JSON blocks before pre-LLM gate."
+                         },
+                         {
+                             "index":  104,
+                             "type":  "markdown_heading_standard_gate",
+                             "summary":  "Block decorative, single-fragment, dosage headings and repeated TOC headings; reran index 104 with one TOC heading, 193 markdown headings, no nonstandard headings, no forced-line-break candidates, and zero LLM calls."
+                         },
+                         {
+                             "index":  102,
+                             "type":  "cover_ocr_heading_residue",
+                             "summary":  "Remove cover OCR fake headings such as 临家中床医 before reliable front matter and block the same fake headings in final gate; reran index 102 with 101 markdown headings, no nonstandard headings, no forced-line-break candidates, and zero LLM calls."
+                         },
+                         {
+                             "index":  100,
+                             "type":  "toc_page_heading_normalization",
+                             "summary":  "Normalize TOC page-number entries to list items and preserve TOC idempotence; reran index 100 with one TOC heading, 268 markdown headings, no nonstandard headings, no forced-line-break candidates, and zero LLM calls."
+                         },
+                         {
+                             "index":  99,
+                             "type":  "toc_page_heading_false_positive",
+                             "summary":  "Keep blocking real TOC page headings while allowing classic citation-number headings and decimal measurement headings; reran index 99 with one TOC heading, 521 markdown headings, no nonstandard headings, no forced-line-break candidates, and zero LLM calls."
+                         },
+                         {
+                             "index":  91,
+                             "type":  "unheaded_split_toc_entry_normalization",
+                             "summary":  "Keep unheaded TOC blocks open when a title line is followed by a standalone page-marker heading such as ## (262), then merge it into a list entry before pre-LLM gate."
+                         },
+                         {
+                             "index":  87,
+                             "type":  "trailing_series_catalog_ocr_noise",
+                             "summary":  "Remove late series-catalog OCR blocks with # 中国百年百名中医临床家丛书, a surname-order label, a long author list, and fake headings such as # 临中床医 before pre-LLM gate."
+                         },
+                         {
+                             "index":  88,
+                             "type":  "unstructured_front_matter_prefix",
+                             "summary":  "Remove and block long image/CIP/publisher metadata prefixes before the first reliable Markdown heading; reran source 87 and verified first heading is line 1 with zero LLM calls."
+                         },
+                         {
+                             "index":  68,
+                             "type":  "front_matter_title_page_standardization",
+                             "summary":  "Remove non-heading and title-page/publisher metadata blocks before reliable front matter; final gate blocks the same residue. Reran source 67 with first heading line 1 (# 出版者的话), zero LLM calls, and no typical residue hits."
+                         },
+                         {
+                             "index":  107,
+                             "type":  "chronology_range_list_normalization",
+                             "summary":  "Normalize biography/year-spectrum chronology lines that start with year ranges into Markdown list items before pre-LLM gate; reran source 106 with forced-line-break candidates 0, final accepted, zero LLM calls, and first heading line 1."
+                         },
+                         {
+                             "index":  10,
+                             "type":  "trailing_series_catalog_title_page_residue",
+                             "summary":  "Remove trailing 中国百年百名中医临床家丛书 title/catalog blocks, including table-form name lists and short title-page tails; final gate blocks the same heading residue. Reran source 10 with all local-gate checks accepted and zero LLM calls."
+                         },
+                         {
+                             "index":  12,
+                             "type":  "final_clean_reintroduced_duplicate_toc_outline",
+                             "summary":  "Run trailing duplicate TOC outline removal again after final clean/heading normalization; reran source 12 with pre-LLM and final gates accepted, one TOC heading, no nonstandard headings, and zero LLM calls."
+                         },
+                         {
+                             "index":  13,
+                             "type":  "trailing_cover_ocr_heading_noise",
+                             "summary":  "Remove trailing cover OCR fake heading # 临中床医 before pre-LLM gate; reran source 13 with all local-gate checks accepted and zero LLM calls."
+                         },
+                         {
+                             "index":  15,
+                             "type":  "journal_volume_issue_citation_heading_false_positive",
+                             "summary":  "Allow journal year-volume-issue citation headings such as 摘自《中西医结合杂志》1987；7（2） in final gate while preserving TOC page-heading blocking; reran source 15 with all local-gate checks accepted and zero LLM calls."
+                         },
+                         {
+                             "index":  4,
+                             "type":  "trailing_cover_ocr_tail_block",
+                             "summary":  "Remove trailing cover OCR tail blocks that contain fake headings such as # 临中床医 followed by image or price metadata; reran source 4 with all local-gate checks accepted and zero LLM calls."
+                         },
+                         {
+                             "index":  6,
+                             "type":  "front_series_catalog_and_classic_clause_heading",
+                             "summary":  "Remove longer pre-TOC series author catalog blocks and allow classic clause-number headings such as 干呕，吐涎沫，头痛者，吴茱萸汤主之。(377); reran source 6 with all local-gate checks accepted and zero LLM calls."
+                         }
+                     ],
+    "known_drift":  {
+                        "unverified_artifacts_after_checkpoint":  false,
+                        "deferred_backward_next_index":  null,
+                        "deferred_backward_next_source_stem":  null,
+                        "remaining_unstructured_front_matter_candidates":  [],
+                        "handling":  "The active ascending local-gate pass has verified all 112 discovered books under the current full local-gate contract. No next book remains for this pass."
+                    },
+    "next_command":  "COMPLETE: all 112 discovered books have been verified; do not run another local-gate book from this anchor.",
+    "verification_contract":  [
+                                  "batch summary: status == passed for current index",
+                                  "quality.json: pre_llm_gate.accepted == true and errors == []",
+                                  "final_acceptance.json: accepted == true and blocking_errors == []",
+                                  "all llm_calls.jsonl files for the book are 0 bytes",
+                                  "final Markdown first nonblank line is a valid heading, title-page/publisher metadata blocks are removed, exactly one TOC heading if a TOC exists, and zero nonstandard heading residues",
+                                  "final Markdown has zero real hits for the current deterministic residue set",
+                                  "no residual long-running python.exe/pytest/llmcheck process remains"
+                              ]
+}

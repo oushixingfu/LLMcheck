@@ -15,8 +15,8 @@ import time
 import urllib.error
 import urllib.request
 
+from llmcheck.final_gate import quality_hints
 from llmcheck.profiles import DocumentProfile, get_profile
-from llmcheck.quality import quality_hints
 
 
 class CircuitBreaker:
@@ -65,11 +65,14 @@ class LlmConfig:
     api_key: str
     model: str
     timeout_seconds: int = 600
+    max_calls_per_book: int = 0
 
 
 class LlmClient:
     def __init__(self, config: LlmConfig) -> None:
         self.config = config
+        self._call_lock = Lock()
+        self._call_count = 0
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=int(os.environ.get("LLMCHECK_CIRCUIT_FAILURE_THRESHOLD", "5")),
             recovery_timeout_seconds=float(os.environ.get("LLMCHECK_CIRCUIT_RECOVERY_SECONDS", "60")),
@@ -78,6 +81,25 @@ class LlmClient:
     @property
     def circuit_breaker(self) -> CircuitBreaker:
         return self._circuit_breaker
+
+    @property
+    def call_count(self) -> int:
+        with self._call_lock:
+            return self._call_count
+
+    def _reserve_call(self) -> dict[str, Any] | None:
+        max_calls = max(0, int(self.config.max_calls_per_book))
+        with self._call_lock:
+            if max_calls and self._call_count >= max_calls:
+                return {
+                    "status": "error",
+                    "error": f"LLM call budget exceeded: {self._call_count}/{max_calls}",
+                    "code": "llm_call_budget_exceeded",
+                    "call_count": self._call_count,
+                    "max_calls_per_book": max_calls,
+                }
+            self._call_count += 1
+            return None
 
     def _max_attempts(self) -> int:
         raw_value = os.environ.get("LLMCHECK_LLM_RETRIES")
@@ -91,6 +113,9 @@ class LlmClient:
     def complete_json(self, prompt: str) -> dict[str, Any]:
         if self._circuit_breaker.is_open:
             return {"status": "error", "error": "LLM circuit breaker is open (consecutive failures exceeded threshold)"}
+        budget_error = self._reserve_call()
+        if budget_error is not None:
+            return budget_error
         result = self._complete_json_with_curl(prompt) if os.environ.get("LLMCHECK_LLM_TRANSPORT") == "curl" else self._complete_json_with_urllib(prompt)
         if result.get("status") == "error":
             self._circuit_breaker.record_failure()
@@ -308,6 +333,108 @@ def build_acceptance_prompt(*, source_name: str, text_path: Path, text: str, pro
         f"{text}\n"
         "<TEXT_END>\n"
     )
+
+
+def build_review_prompt(*, source_name: str, text_path: Path, text: str, profile: DocumentProfile | None = None) -> str:
+    document_profile = profile or get_profile()
+    return (
+        "你是标准 Markdown 文档的人类视角审查员。任务：从交付质量角度审查当前文本，识别一眼可见的问题，并给出结构化 issue 列表。\n"
+        "\n"
+        "审查重点：\n"
+        "1. Markdown 标题、段落、列表、表格等结构是否明显损坏。\n"
+        "2. 是否残留 LaTeX/公式/单位噪声，例如 \\mathrm、\\circ 或多余的 $。\n"
+        "3. 是否存在明显 OCR 噪声、乱码、错行、粘连、异常空格或结构断裂。\n"
+        "4. 是否存在会影响交付的内容缺失风险、目录层级问题或表格破坏。\n"
+        "5. 只报告显著问题；无法确认时保守处理。\n"
+        "\n"
+        "硬性规则：\n"
+        "1. 只输出 issues，不得输出 corrected_text、repaired_text 或任何全文改写结果。\n"
+        "2. 不得凭空补写原文，不得因为追求通顺而重写正文。\n"
+        "3. accepted 只有在没有 blocking/major 级问题时才可为 true。\n"
+        "4. safe_fix_type 只能使用 rule_fix、safe_llm_patch、manual_review、none。\n"
+        "\n"
+        "文档 profile：\n"
+        f"{_profile_prompt_block(document_profile)}"
+        "\n"
+        "请只返回 JSON，不要 Markdown，不要代码块。格式：\n"
+        "{\n"
+        '  "status": "reviewed",\n'
+        '  "accepted": true 或 false,\n'
+        '  "confidence": 0.0 到 1.0,\n'
+        '  "summary": "一句中文结论",\n'
+        '  "issues": [{\n'
+        '    "id": "issue-001",\n'
+        '    "category": "latex_artifact|markdown_structure|heading_hierarchy|paragraph_break|ocr_noise|mojibake|table_broken|content_loss_risk|pdf_md_mismatch|model_uncertain|other",\n'
+        '    "severity": "blocking|major|minor",\n'
+        '    "location_hint": "章节/页码/行号线索",\n'
+        '    "excerpt": "短摘录",\n'
+        '    "reason": "为什么这是问题",\n'
+        '    "suggested_action": "建议动作",\n'
+        '    "safe_fix_type": "rule_fix|safe_llm_patch|manual_review|none"\n'
+        "  }],\n"
+        '  "manual_review_notes": ["..."]\n'
+        "}\n"
+        f"\n源文件：{source_name}\n文本路径：{text_path}\n"
+        f"程序只读提示（不能代替你的判断）：{json.dumps(quality_hints(text), ensure_ascii=False)}\n"
+        "\n待审查 Markdown 文本如下：\n<TEXT_BEGIN>\n"
+        f"{text}\n"
+        "<TEXT_END>\n"
+    )
+
+
+def review_result_payload(
+    *,
+    source_name: str,
+    text_path: Path,
+    text: str,
+    client: Any,
+    model: str,
+    profile: DocumentProfile | None = None,
+) -> dict[str, Any]:
+    document_profile = profile or get_profile()
+    prompt = build_review_prompt(source_name=source_name, text_path=text_path, text=text, profile=document_profile)
+    result = client.complete_json(prompt)
+    if result.get("status") == "error":
+        return {
+            "source_name": source_name,
+            "text_path": str(text_path),
+            "content_sha256": _sha256(text),
+            "prompt_sha256": _sha256(prompt),
+            "profile_id": document_profile.id,
+            "model": model,
+            "status": "error",
+            "accepted": False,
+            "issues": [],
+            "manual_review_notes": [],
+            "llm_result": result,
+        }
+    raw_issues = result.get("issues")
+    issues = [dict(issue) for issue in raw_issues if isinstance(issue, dict)] if isinstance(raw_issues, list) else []
+    raw_manual_review_notes = result.get("manual_review_notes")
+    manual_review_notes = (
+        [note.strip() for note in raw_manual_review_notes if isinstance(note, str) and note.strip()]
+        if isinstance(raw_manual_review_notes, list)
+        else []
+    )
+    status = str(result.get("status") or "error")
+    accepted = status == "reviewed" and bool(result.get("accepted")) and not _has_blocking_review_issues(issues)
+    return {
+        "source_name": source_name,
+        "text_path": str(text_path),
+        "content_sha256": _sha256(text),
+        "prompt_sha256": _sha256(prompt),
+        "profile_id": document_profile.id,
+        "model": model,
+        "status": status,
+        "accepted": accepted,
+        "issues": issues,
+        "manual_review_notes": manual_review_notes,
+        "llm_result": result,
+    }
+
+
+def _has_blocking_review_issues(issues: list[dict[str, Any]]) -> bool:
+    return any(str(issue.get("severity") or "").strip().lower() in {"blocking", "major"} for issue in issues)
 
 
 def build_repair_prompt(

@@ -14,3 +14,9 @@ dist/*
 !.env.example
 tmp/
 .codegraph-auto-init.lock
+.codegraph/
+.workbuddy/
+.serena/
+m4/
+tmp/
+*.log

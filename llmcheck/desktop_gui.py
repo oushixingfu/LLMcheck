@@ -47,6 +47,8 @@ class DesktopFormValues:
     mineru_max_retries: int = DEFAULT_MINERU_MAX_RETRIES
     mineru_retry_backoff_seconds: float = DEFAULT_MINERU_RETRY_BACKOFF_SECONDS
     pdf_page_chunk_size: int = DEFAULT_PDF_PAGE_CHUNK_SIZE
+    enable_ppx: bool = False
+    mineru_fallback: str = "none"
     ppx_command: str = DEFAULT_PPX_COMMAND
     ppx_cwd: str = DEFAULT_PPX_CWD
     ppx_timeout_seconds: int = 3600
@@ -83,6 +85,8 @@ def build_settings_from_form(values: DesktopFormValues) -> LlmCheckSettings:
         mineru_max_retries=max(1, int(values.mineru_max_retries)),
         mineru_retry_backoff_seconds=max(0.0, float(values.mineru_retry_backoff_seconds)),
         pdf_page_chunk_size=max(1, int(values.pdf_page_chunk_size)),
+        enable_ppx=bool(values.enable_ppx),
+        mineru_fallback=("ppx" if values.enable_ppx and str(values.mineru_fallback or "none").strip().lower() == "ppx" else "none"),
         ppx_command=values.ppx_command.strip(),
         ppx_cwd=values.ppx_cwd.strip(),
         ppx_timeout_seconds=max(10, int(values.ppx_timeout_seconds)),
@@ -169,6 +173,8 @@ class DesktopGuiApp:
             "mineru_max_retries": tk.StringVar(value=str(DEFAULT_MINERU_MAX_RETRIES)),
             "mineru_retry_backoff_seconds": tk.StringVar(value=str(DEFAULT_MINERU_RETRY_BACKOFF_SECONDS)),
             "pdf_page_chunk_size": tk.StringVar(value=str(DEFAULT_PDF_PAGE_CHUNK_SIZE)),
+            "enable_ppx": tk.BooleanVar(value=False),
+            "mineru_fallback": tk.StringVar(value="none"),
             "ppx_command": tk.StringVar(value=DEFAULT_PPX_COMMAND),
             "ppx_cwd": tk.StringVar(value=DEFAULT_PPX_CWD),
             "ppx_timeout_seconds": tk.StringVar(value="3600"),
@@ -292,12 +298,16 @@ class DesktopGuiApp:
         self._entry_row(frame, 10, "重试次数", "mineru_max_retries")
         self._entry_row(frame, 11, "退避秒数", "mineru_retry_backoff_seconds")
         self._entry_row(frame, 12, "PDF 切片页数", "pdf_page_chunk_size")
-        self._entry_row(frame, 13, "PPX 命令", "ppx_command")
-        self._entry_row(frame, 14, "PPX 工作目录", "ppx_cwd")
-        self._entry_row(frame, 15, "PPX 超时秒", "ppx_timeout_seconds")
-        self._combo_row(frame, 16, "PPX 后端", "ppx_backend", ("default",))
-        self._combo_row(frame, 17, "PPX OCR", "ppx_ocr", ("auto", "yes", "no"))
-        self._combo_row(frame, 18, "PPX 公式", "ppx_formula", ("no", "auto", "yes"))
+        self.ttk.Checkbutton(frame, text="启用本地 PPX（默认关，易卡死机器）", variable=self.vars["enable_ppx"]).grid(
+            row=13, column=0, columnspan=2, sticky="w", pady=4
+        )
+        self._combo_row(frame, 14, "MinerU 失败回退", "mineru_fallback", ("none", "ppx"))
+        self._entry_row(frame, 15, "PPX 命令", "ppx_command")
+        self._entry_row(frame, 16, "PPX 工作目录", "ppx_cwd")
+        self._entry_row(frame, 17, "PPX 超时秒", "ppx_timeout_seconds")
+        self._combo_row(frame, 18, "PPX 后端", "ppx_backend", ("default",))
+        self._combo_row(frame, 19, "PPX OCR", "ppx_ocr", ("auto", "yes", "no"))
+        self._combo_row(frame, 20, "PPX 公式", "ppx_formula", ("no", "auto", "yes"))
         return frame
 
     def _build_batch_section(self, parent: Any) -> Any:
@@ -437,6 +447,8 @@ class DesktopGuiApp:
             mineru_max_retries=self._int_value("mineru_max_retries"),
             mineru_retry_backoff_seconds=self._float_value("mineru_retry_backoff_seconds"),
             pdf_page_chunk_size=self._int_value("pdf_page_chunk_size"),
+            enable_ppx=bool(self.vars["enable_ppx"].get()),
+            mineru_fallback=get("mineru_fallback") or "none",
             ppx_command=get("ppx_command"),
             ppx_cwd=get("ppx_cwd"),
             ppx_timeout_seconds=self._int_value("ppx_timeout_seconds"),

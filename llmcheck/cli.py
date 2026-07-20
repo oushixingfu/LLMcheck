@@ -93,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--mineru-max-retries", type=int, default=DEFAULT_MINERU_MAX_RETRIES)
     run.add_argument("--mineru-retry-backoff-seconds", type=float, default=DEFAULT_MINERU_RETRY_BACKOFF_SECONDS)
     run.add_argument("--pdf-page-chunk-size", type=int, default=DEFAULT_PDF_PAGE_CHUNK_SIZE)
+    run.add_argument("--enable-ppx", action="store_true", help="Opt-in local PPX audit/fallback (default off; can freeze the machine).")
+    run.add_argument("--mineru-fallback", choices=("ppx", "none"), default="none", help="Only used with --enable-ppx. Default none.")
     run.add_argument("--ppx-command", default="/mnt/d/codex/memect-ppx/ppx")
     run.add_argument("--ppx-cwd", default="/mnt/d/codex/memect-ppx")
     run.add_argument("--ppx-timeout-seconds", type=int, default=3600)
@@ -122,7 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--preflight-only", action="store_true")
     batch.add_argument("--skip-existing", action="store_true", default=True)
     batch.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
-    batch.add_argument("--mineru-fallback", choices=("ppx", "none"), default="ppx")
+    batch.add_argument("--enable-ppx", action="store_true", help="Opt-in local PPX audit/fallback (default off).")
+    batch.add_argument("--mineru-fallback", choices=("ppx", "none"), default="none", help="Only used with --enable-ppx. Default none.")
     batch.add_argument("--max-cleanup-loops", type=int, default=3)
     batch.add_argument("--stop-on-global-service-error", action="store_true", default=True)
     batch.add_argument("--no-stop-on-global-service-error", dest="stop_on_global_service_error", action="store_false")
@@ -189,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     model_compare.add_argument("--mineru-max-retries", type=int, default=DEFAULT_MINERU_MAX_RETRIES)
     model_compare.add_argument("--mineru-retry-backoff-seconds", type=float, default=DEFAULT_MINERU_RETRY_BACKOFF_SECONDS)
     model_compare.add_argument("--pdf-page-chunk-size", type=int, default=DEFAULT_PDF_PAGE_CHUNK_SIZE)
+    model_compare.add_argument("--enable-ppx", action="store_true", help="Opt-in local PPX audit/fallback (default off).")
+    model_compare.add_argument("--mineru-fallback", choices=("ppx", "none"), default="none", help="Only used with --enable-ppx. Default none.")
     model_compare.add_argument("--ppx-command", default="/mnt/d/codex/memect-ppx/ppx")
     model_compare.add_argument("--ppx-cwd", default="/mnt/d/codex/memect-ppx")
     model_compare.add_argument("--ppx-timeout-seconds", type=int, default=3600)
@@ -231,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
     agent_convert.add_argument("--concurrency", type=int, default=DEFAULT_LLM_CONCURRENCY)
     agent_convert.add_argument("--profile", default=DEFAULT_PROFILE_ID, choices=profile_choices)
     agent_convert.add_argument("--mineru-api-key", default="")
+    agent_convert.add_argument("--enable-ppx", action="store_true", help="Opt-in local PPX (default off; only when the task explicitly requires PPX).")
+    agent_convert.add_argument("--mineru-fallback", choices=("ppx", "none"), default="none", help="Only used with --enable-ppx.")
     agent_status = agent_sub.add_parser("status", help="Read JobReport for an output directory.")
     agent_status.add_argument("--output-dir", required=True, type=Path)
     agent_get_md = agent_sub.add_parser("get-md", help="Return final Markdown only when document status is passed.")
@@ -344,6 +351,7 @@ def _run_agent_command(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0 if payload.get("status") == "passed" else 1
         if args.agent_command == "convert":
+            enable_ppx = bool(getattr(args, "enable_ppx", False))
             report = agent_api.submit_convert(
                 input_path=args.input,
                 output_dir=args.output_dir,
@@ -354,6 +362,8 @@ def _run_agent_command(args: argparse.Namespace) -> int:
                 profile_id=args.profile,
                 mineru_api_key=args.mineru_api_key or None,
                 concurrency=args.concurrency,
+                enable_ppx=enable_ppx,
+                mineru_fallback=(getattr(args, "mineru_fallback", "none") if enable_ppx else "none"),
             )
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report.get("status") == "passed" else 1
@@ -407,7 +417,12 @@ def _settings_from_args(args: argparse.Namespace) -> LlmCheckSettings:
         mineru_request_timeout_seconds=max(10, args.mineru_request_timeout_seconds),
         mineru_max_retries=max(1, args.mineru_max_retries),
         mineru_retry_backoff_seconds=max(0.0, args.mineru_retry_backoff_seconds),
-        mineru_fallback=getattr(args, "mineru_fallback", "ppx"),
+        enable_ppx=bool(getattr(args, "enable_ppx", False)),
+        mineru_fallback=(
+            str(getattr(args, "mineru_fallback", "none") or "none")
+            if bool(getattr(args, "enable_ppx", False))
+            else "none"
+        ),
         pdf_page_chunk_size=max(1, args.pdf_page_chunk_size),
         ppx_command=args.ppx_command,
         ppx_cwd=args.ppx_cwd,

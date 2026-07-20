@@ -165,6 +165,33 @@ def test_clean_markdown_text_normalizes_latex_array_residue() -> None:
     assert "\\\\" not in cleaned
 
 
+def test_clean_markdown_text_normalizes_latex_aligned_flowchart_residue() -> None:
+    text = (
+        "风中 \\left\\{aligned经络——口眼不正\\\\ 身肢——偏枯不遂\\\\ 脏——内闭\\\\ "
+        "腑——便溺不利\\\\ 脏腑——内闭外脱aligned.\n"
+        "伤脾 \\left\\{ array{l l} 伤阴——口干 \\\\ 伤阳——便溏 array .\n"
+    )
+
+    cleaned = clean_markdown_text(text)
+
+    assert "风中 经络——口眼不正；身肢——偏枯不遂；脏——内闭；腑——便溺不利；脏腑——内闭外脱" in cleaned
+    assert "伤脾 伤阴——口干；伤阳——便溏" in cleaned
+    assert "\\left" not in cleaned
+    assert "aligned" not in cleaned
+    assert "array" not in cleaned
+    assert "latex_artifacts" not in final_acceptance_report(cleaned)["blocking_errors"]
+
+
+def test_clean_markdown_text_normalizes_latex_mid_in_tables() -> None:
+    text = "| 肺(金) | 补土{太渊 \\mid 太白} | 泻水{尺泽 \\mid 阴谷} |\n"
+
+    cleaned = clean_markdown_text(text)
+
+    assert "补土{太渊 | 太白}" in cleaned or "补土{太渊|太白}" in cleaned
+    assert "\\mid" not in cleaned
+    assert "latex_artifacts" not in final_acceptance_report(cleaned)["blocking_errors"]
+
+
 def test_clean_markdown_text_normalizes_latex_bigcirc_bullets() -> None:
     text = "\\bigcirc 咳血，针灸肺俞。\\bigcirc 咯血，针郄门。\n"
 
@@ -191,6 +218,14 @@ def test_clean_markdown_text_normalizes_latex_triangle_bullets() -> None:
 
     assert "△ 有些治学不严谨" in cleaned
     assert "\\triangle" not in cleaned
+
+
+def test_clean_markdown_text_normalizes_latex_wedge_geometry_marker() -> None:
+    text = "再以纸绳作 \\wedge 字形，中间置鼻中膈之下，两端齐口角。"
+    cleaned = clean_markdown_text(text)
+    assert "\\wedge" not in cleaned
+    assert "∧" in cleaned
+    assert "latex_artifacts" not in final_acceptance_report(cleaned)["blocking_errors"]
 
 
 def test_clean_markdown_text_normalizes_latex_odot_and_theta_symbols() -> None:

@@ -5,7 +5,7 @@ description: Convert PDF/Markdown/image/Office documents into gate-checked Markd
 
 # LLMcheck
 
-Use this skill when the user or workflow needs stable document → Markdown conversion with dual-engine acquisition (MinerU API + local PPX), deterministic cleaning, structure normalization, quality gates, and optional LLM review.
+Use this skill when the user or workflow needs stable document → Markdown conversion with MinerU API acquisition, optional local PPX (opt-in only), deterministic cleaning, structure normalization, quality gates, and optional LLM review.
 
 ## Install (once per machine)
 
@@ -61,6 +61,8 @@ llmcheck agent convert \
   --output-dir /path/to/output \
   --profile general_standard_document \
   --llm-mode local-gate
+# PPX is OFF by default. Only add when the task explicitly requires local PPX:
+# --enable-ppx --mineru-fallback ppx
 
 llmcheck agent status --output-dir /path/to/output
 
@@ -90,7 +92,7 @@ md = agent_api.get_final_markdown(output_dir="/path/to/output", document_id=doc_
 
 ```text
 upload/path
-→ dual acquisition (MinerU API ∥ local PPX)
+→ acquisition (MinerU API; optional local PPX only if --enable-ppx)
 → Cross Select → process/.../cross/initial.md
 → deterministic clean + structure
 → pre-LLM gate
@@ -165,6 +167,8 @@ Use this skill when the user says things like:
 ## Notes
 
 - Runtime dependency: Python ≥3.12 package `LLMcheck` from this repository.
-- Local PPX is optional audit/fallback when configured; MinerU token is required for non-Markdown conversion without cache.
+- **Local PPX is OFF by default.** Only pass `--enable-ppx` (and optionally `--mineru-fallback ppx`) when the user/task explicitly requires PPX. Default dual-start of PPX can freeze the machine.
+- MinerU token is required for non-Markdown conversion without cache.
+- Prefer **one book at a time** when iterating cleaning/layout rules; do not fan out whole series by default.
 - Human CLI (`llmcheck run` / `batch` / `gui`) still exists; agents should prefer `llmcheck agent *`.
 - Design: `docs/prd/2026-07-18-agent-callable-dual-engine-pipeline.md` in the repo.

@@ -274,8 +274,10 @@ def _has_toc_page_heading_residue(text: str) -> bool:
         content = heading_match.group(1).strip()
         if _looks_like_toc_page_entry(content):
             return True
-        if _is_major_document_heading(content):
-            in_toc = False
+        # Any non-TOC heading after 目录 means body structure has started.
+        # Do not keep scanning later clinical headings for false page suffixes
+        # (``住院号 1165`` / incomplete ``第（67）`` cross-refs).
+        in_toc = False
     toc_declared_body_titles = _toc_declared_body_title_keys(text)
     for raw_line in text.splitlines():
         heading_match = re.match(r"^#{1,6}\s+(.+?)\s*$", raw_line.strip())
@@ -395,16 +397,38 @@ def _has_title_page_block_before_reliable_front_matter(lines: list[str], first_h
 
 def _looks_like_reliable_front_matter_heading(line: str) -> bool:
     content = re.sub(r"^#{1,6}\s+", "", line.strip()).strip()
-    return content in {"出版者的话", "内容提要", "目录", "目錄"}
+    return content in {"出版者的话", "出版说明", "内容提要", "目录", "目錄"}
 
 
 def _looks_like_front_matter_metadata_line(line: str) -> bool:
-    content = line.strip()
+    content = re.sub(r"^#{1,6}\s+", "", line.strip()).strip()
     if re.search(r"ISBN|CIP|R·\d+|/R[.·]\d+", content, flags=re.IGNORECASE):
+        return True
+    if re.search(r"[/／].{0,40}著[.—\-—–]|[.—\-—–].{0,20}出版社", content):
+        return True
+    if re.search(r"科技新书目|统一书号|新华书店|发行所|胶印厂|印数\s*[:：]?", content):
+        return True
+    imprint_hits = sum(
+        1
+        for marker in (
+            "印刷",
+            "开本",
+            "印张",
+            "印次",
+            "版次",
+            "定价",
+            "书号",
+            "发行",
+            "出版社",
+            "毫米",
+        )
+        if marker in content
+    )
+    if imprint_hits >= 3 and len(content) >= 24:
         return True
     return bool(
         re.search(
-            r"(?:中国版本图书馆|发行者|印刷者|经销者|开本|字数|印张|版次|印次|册数|书号|定价|邮编|电话|邮购|质量问题|出版社|HTTP)",
+            r"(?:中国版本图书馆|发行者|印刷者|经销者|开\s*本|字\s*数|印\s*张|版\s*次|印\s*次|册数|书号|标准书号|定价|邮编|电话|邮购|质量问题|出版社|出版发行|著者|网址|著作权|HTTP|www\.|pmph|E\s*-\s*mail|印刷厂|经销|中继线)",
             content,
             flags=re.IGNORECASE,
         )
@@ -415,9 +439,15 @@ def _looks_like_front_title_page_line(line: str) -> bool:
     content = re.sub(r"^#{1,6}\s+", "", line.strip()).strip()
     if content in {"临中床医", "临中家医", "临中家医床", "临家中床医", "临中", "家医"}:
         return True
-    if re.search(r"(?:主编|执行主编|副主编|编委|编著|整理|作者|责任编辑|封面设计|丛编项|图书|网店|购买)", content):
+    if re.search(r"(?:主编|执行主编|副主编|编委|编著|合著|整理|作者|责任编辑|封面设计|丛编项|图书|网店|购买)", content):
+        return True
+    if re.search(r"(?:合著|编著|主编|著者|著)$", content):
         return True
     if "中国百年百名中医临床家丛书" in content:
+        return True
+    if "现代著名老中医名著重刊丛书" in content:
+        return True
+    if re.fullmatch(r"第[一二三四五六七八九十\d]+辑", content):
         return True
     if "出版社" in content:
         return True
@@ -432,6 +462,10 @@ def _is_markdown_image_line(line: str) -> bool:
 
 def _looks_like_toc_page_entry(content: str) -> bool:
     normalized = re.sub(r"\s+", " ", content).strip()
+    if _looks_like_clinical_case_or_cross_ref_heading(normalized):
+        return False
+    if _looks_like_figure_or_table_caption_heading(normalized):
+        return False
     parenthetical_page = re.search(r"[（(]\d+[）)]$", normalized)
     if parenthetical_page:
         title = normalized[: parenthetical_page.start()].strip()
@@ -441,7 +475,12 @@ def _looks_like_toc_page_entry(content: str) -> bool:
             return False
         if _looks_like_year_reading_plan_heading(title):
             return False
-        if len(title) >= 24 and re.search(r"[“”‘’《》。，、；：！？]", title):
+        if _looks_like_clinical_case_or_cross_ref_heading(title):
+            return False
+        # Incomplete cross-ref residue: ``…第（67`` / ``…见 …（12``
+        if re.search(r"(?:第|见|見|参|參)\s*$", title):
+            return False
+        if len(title) >= 24 and re.search(r"[“”‘’《》。，、；：！？\[\]]", title):
             return False
         return True
     if _looks_like_journal_volume_issue_page_citation(normalized):
@@ -451,6 +490,40 @@ def _looks_like_toc_page_entry(content: str) -> bool:
         or re.search(r"\s+\d{1,4}$", normalized)
         or re.search(r"(?:\.{2,}|．{2,}|…{1,}|·{2,})\d{1,4}$", normalized)
     )
+
+
+def _looks_like_figure_or_table_caption_heading(content: str) -> bool:
+    """Body figure/table captions such as ``图 3`` / ``表12`` / ``附图 1``."""
+    normalized = re.sub(r"\s+", " ", content).strip()
+    return bool(
+        re.fullmatch(
+            r"(?:附)?(?:图|表|圖|錶)\s*[一二三四五六七八九十百千〇零两\d]+(?:[-–—]\d+)?(?:\s*[:：].{0,40})?",
+            normalized,
+        )
+    )
+
+
+def _looks_like_clinical_case_or_cross_ref_heading(content: str) -> bool:
+    """Body clinical headings that only happen to end with digits / parentheses."""
+    normalized = re.sub(r"\s+", " ", content).strip()
+    if not normalized:
+        return False
+    if re.search(r"(?:门诊号|住院号|病案号|病历号)\s*[:：]?\s*\d+\s*[。.]?$", normalized):
+        return True
+    if re.match(r"^(?:例|案)\s*[一二三四五六七八九十百千〇零两\d]+", normalized):
+        return True
+    if re.search(r"[\[【]\s*见\s*", normalized) or re.search(r"见\s*[“\"《]", normalized):
+        return True
+    # Clinical stats / outcome headings: ``…痊愈者 80 例，显效者 80``
+    if re.search(r"(?:例|人次|穴位|针次)\s*$", normalized) or re.search(
+        r"(?:痊愈者|显效者|有效者|治疗)\s*\d+", normalized
+    ):
+        return True
+    # Body syndrome→formula titles that keep an outer page-like ``(n)``:
+    # ``湿热郁于血分——滑石白鱼散(行水消瘀) (11)``
+    if "——" in normalized and re.search(r"(?:汤|散|丸|饮|膏|丹|煎|方)\s*[（(]", normalized):
+        return True
+    return False
 
 
 def _looks_like_journal_volume_issue_citation(title: str) -> bool:
@@ -474,7 +547,21 @@ def _looks_like_journal_volume_issue_page_citation(title: str) -> bool:
 
 def _looks_like_classic_clause_number_citation(title: str) -> bool:
     normalized = re.sub(r"\s+", " ", title).strip()
-    return bool(re.search(r"[，,。].{0,40}主之[。.]?$", normalized))
+    if re.search(r"[，,。].{0,40}主之[。.]?$", normalized):
+        return True
+    # 《伤寒论》 style source-marked clauses: ``【原文】…`` / ``〔原文〕…``
+    if re.match(r"^[【\[〔]\s*原文\s*[】\]〕]", normalized):
+        return True
+    # OCR-split classic body clauses that still look like continuous classical prose
+    # rather than short TOC titles, e.g. ``谷，脾胃气尚弱…损谷则愈。``
+    if (
+        len(normalized) >= 16
+        and re.search(r"[，,。；;]", normalized)
+        and re.search(r"[。；;]\s*$", normalized)
+        and not re.search(r"(?:目录|頁|页码)", normalized)
+    ):
+        return True
+    return False
 
 
 def _looks_like_year_reading_plan_heading(title: str) -> bool:
@@ -487,13 +574,21 @@ def _looks_like_year_reading_plan_heading(title: str) -> bool:
 
 def _is_major_document_heading(content: str) -> bool:
     base = re.sub(r"\s*[（(]\d+[）)]\s*$", "", content).strip()
+    base = re.sub(r"^附录[：:]\s*", "附录", base)
     return base in {
         "目录",
+        "目錄",
+        "日录",
+        "日錄",
         "出版者的话",
+        "出版说明",
         "内容提要",
         "编写说明",
         "序",
+        "自序",
         "前言",
+        "凡例",
+        "凡 例",
         "医家小传",
         "专病论治",
         "临证特色",
@@ -501,11 +596,13 @@ def _is_major_document_heading(content: str) -> bool:
         "学术思想",
         "年谱",
         "附录",
+        "索引",
+        "结语",
         "后记",
         "常见病辨证施针",
         "辨证选穴施针精要",
         "临床中医",
-    }
+    } or base.startswith("附录：") or base.startswith("附录:")
 
 
 
@@ -545,6 +642,7 @@ def _has_repeated_short_lines(text: str) -> bool:
             and not line.startswith(("#", "|"))
             and not _is_standalone_list_marker(line)
             and not _is_repeated_content_label(line)
+            and not _looks_like_repeated_formula_line(line)
         ):
             counts[line] = counts.get(line, 0) + 1
     return any(count >= 3 for count in counts.values())
@@ -558,6 +656,20 @@ def _is_repeated_content_label(line: str) -> bool:
     return bool(re.fullmatch(r"(?:(?:[-*+]\s*)+)?【[^】]{1,12}】", line))
 
 
+def _looks_like_repeated_formula_line(line: str) -> bool:
+    """True for TCM formula/ingredient rows that legitimately repeat in body text."""
+    compact = re.sub(r"\s+", " ", line).strip()
+    if not compact or len(compact) > 40:
+        return False
+    # e.g. ``逍遥散 当归 白芍 柴胡 白术 茯苓 甘草`` / ``金黄散 南星 陈皮 ...``
+    return bool(
+        re.match(
+            r"^[㐀-鿿A-Za-z0-9·•]{1,12}(?:汤|散|丸|饮|膏|丹|煎|方)\s+[㐀-鿿A-Za-z]",
+            compact,
+        )
+    )
+
+
 
 def _looks_like_forced_break(previous: str, current: str, *, structure_labels: tuple[str, ...] | None = None) -> bool:
     labels = structure_labels or DEFAULT_STRUCTURE_LABELS
@@ -568,6 +680,18 @@ def _looks_like_forced_break(previous: str, current: str, *, structure_labels: t
     if current.startswith(labels) or previous.endswith("年版"):
         return False
     if re.match(r"^([一二三四五六七八九十]+、|\d+[.、])", current):
+        return False
+    # Complete formula units are intentional separate lines for QA/claim extraction.
+    if _looks_like_formula_unit_line(previous) or _looks_like_formula_unit_line(current):
+        return False
+    # Prescription / dose rows and their following usage notes are separate semantic units.
+    if _looks_like_prescription_or_dose_line(previous) or _looks_like_prescription_or_dose_line(current):
+        return False
+    if re.match(r"^(?:按[：:]|此方|处方[：:]|共为|隔两日|嘱仍|古人治|此症|药用)", current):
+        return False
+    # Incomplete OCR paragraph tails should join later in cleaning; for the gate,
+    # only flag ordinary forced breaks, not dose continuations like ``9克共为细末``.
+    if re.match(r"^\d+(?:\.\d+)?\s*克", current) and previous.count("克") >= 1:
         return False
     return _looks_like_general_paragraph_fragment(previous, current)
 
@@ -582,6 +706,8 @@ def _looks_like_blank_separated_forced_break(
         return False
     if _looks_like_front_matter_line(previous) or _looks_like_front_matter_line(current):
         return False
+    if _looks_like_formula_unit_line(previous) or _looks_like_formula_unit_line(current):
+        return False
     return _looks_like_forced_break(previous, current, structure_labels=structure_labels)
 
 
@@ -589,6 +715,12 @@ def _looks_like_blank_separated_formula_fragment(previous: str, current: str) ->
     if not previous or not current:
         return False
     if _looks_like_case_heading_line(previous) or _looks_like_front_matter_line(previous):
+        return False
+    # A new formula name starts a new unit — not a broken fragment of the previous one.
+    if _looks_like_formula_unit_line(current):
+        return False
+    # Dose continuation / usage note after a prescription row is intentional structure.
+    if _looks_like_prescription_or_dose_line(previous) or _looks_like_prescription_or_dose_line(current):
         return False
     dosage = r"\d+(?:\.\d+)?\s*(?:g|克|kg|mg|ml|mL|帖|付|枚|片|丸|粒|钱|分)"
     if len(current) > 240:
@@ -600,6 +732,80 @@ def _looks_like_blank_separated_formula_fragment(previous: str, current: str) ->
     if not re.search(dosage, current, flags=re.IGNORECASE):
         return False
     return bool(re.search(r"[㐀-鿿A-Za-z0-9]$", previous) and re.search(r"^[㐀-鿿A-Za-z0-9]", current))
+
+
+def _looks_like_formula_unit_line(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped or stripped.startswith(("#", "|", "-", "*", "!", ">")):
+        return False
+    if len(stripped) > 200:
+        return False
+    # Named formula units, optionally followed by a short usage note:
+    # ``苍术白虎汤 即白虎汤加苍术。`` / ``竹叶石膏汤 治肺胃有热，呕渴少气。``
+    if re.match(
+        r"^[㐀-鿿A-Za-z]{1,12}(?:\s*[㐀-鿿A-Za-z]{0,8})?(?:汤|散|丸|饮|膏|丹|煎|胶)"
+        r"(?:\s|$|[㐀-鿿A-Za-z0-9（(])",
+        stripped,
+    ):
+        return True
+    return False
+
+
+def _looks_like_prescription_or_dose_line(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped or stripped.startswith(("#", "|", "-", "*", "!", ">")):
+        return False
+    if re.match(r"^(?:处方|药用|方药|治法)[：:]", stripped):
+        return True
+    # Dense dose rows: multiple ``克`` tokens or leading date-like dose lines.
+    if stripped.count("克") >= 2 and len(stripped) <= 240:
+        return True
+    if re.match(r"^(?:\d+(?:\.\d+)?\s*克\b)", stripped) and re.search(r"[㐀-鿿]", stripped):
+        return True
+    if re.match(r"^(?:共为|为粗末|每次|午、|早晚各服)", stripped):
+        return True
+    # Usage / pack count rows: ``（分两次服） 二付`` / ``日三服`` / ``杏仁一升，合皮熟，研用``
+    if re.search(r"(?:分两次服|日[二三]服|二付|三付|研用|合皮熟)", stripped) and len(stripped) <= 40:
+        return True
+    if re.fullmatch(r"[（(][^）)]{1,16}[）)]\s*[一二三四五六七八九十两\d]+付", stripped):
+        return True
+    # Classical multi-herb dose rows with 两/钱/升/握 etc. (not only 克):
+    # ``葱白一握 豆豉一升`` / ``滑石六两 甘草一两`` / ``高良姜酒炒 香附醋炒，等分``
+    classical_dose = r"(?:两|钱|分|升|合|握|枚|片|粒|味|贴|帖|付|剂|匙|杯|碗|盅)"
+    if (
+        len(stripped) <= 80
+        and len(re.findall(rf"(?:[一二三四五六七八九十百千万半两]+|\d+(?:\.\d+)?)\s*{classical_dose}", stripped)) >= 2
+        and re.search(r"[㐀-鿿]", stripped)
+        and not re.search(r"[。！？!?]", stripped)
+    ):
+        return True
+    if (
+        len(stripped) <= 60
+        and re.search(r"(?:酒炒|醋炒|等分|各等分|盐水炒|姜汁炒)", stripped)
+        and re.search(r"[㐀-鿿]{2,}", stripped)
+        and not re.search(r"[。！？!?]", stripped)
+    ):
+        return True
+    # Bare multi-herb formula rows without doses, common in classical case books:
+    # ``熟地 归身 炙草 人参 肉桂`` / ``安桂 茯苓 於术 甘草``
+    if _looks_like_bare_multi_herb_line(stripped):
+        return True
+    return False
+
+
+def _looks_like_bare_multi_herb_line(value: str) -> bool:
+    stripped = re.sub(r"\s+", " ", value).strip()
+    if not stripped or len(stripped) > 80:
+        return False
+    if re.search(r"[。！？!?；;：:，,、0-9]", stripped):
+        return False
+    tokens = [tok for tok in re.split(r"[\s　]+", stripped) if tok]
+    if len(tokens) < 3:
+        return False
+    # Each token is a short CJK herb / processed-herb name.
+    if not all(re.fullmatch(r"[㐀-鿿A-Za-z]{1,6}", tok) for tok in tokens):
+        return False
+    return True
 
 
 def _looks_like_case_heading_line(value: str) -> bool:

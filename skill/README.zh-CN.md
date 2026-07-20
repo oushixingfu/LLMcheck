@@ -58,7 +58,9 @@ llmcheck agent get-md --output-dir /path/out --document-id <id>
 
 ## 流程一句话
 
-MinerU API ∥ 本地 PPX → 交叉择优 initial.md → 清洗/结构/门禁 → 仅 passed 写入 md/
+MinerU API（默认）→ 可选本地 PPX（仅 `--enable-ppx`）→ 交叉择优 initial.md → 清洗/结构/门禁 → 仅 passed 写入 md/
+
+**PPX 默认关闭。** 只有任务明确要求本地 PPX 时才加 `--enable-ppx`；否则容易卡死机器。默认按**一本一本**跑，边跑边迭代清洗/排版规则。
 
 ## 触发话术示例
 

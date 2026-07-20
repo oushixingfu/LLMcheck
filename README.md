@@ -64,11 +64,11 @@ llmcheck profiles
 ## 输入流程
 
 - Markdown (`.md`)：直接进入清洗、纠错、验收和最终收口。
-- PDF (`.pdf`)：并行启动 MinerU API VLM 和本地 PPX 审计。MinerU 合并 Markdown 是正式文本来源；PPX 结果保留在 `process/` 供审计和返修参考。
+- PDF (`.pdf`)：默认只走 MinerU API VLM。本地 PPX 审计/回退为**可选**，需显式 `--enable-ppx`（否则不启动，避免卡死机器）。
 - 图片：`.png`, `.jpg`, `.jpeg`, `.jp2`, `.webp`, `.gif`, `.bmp`，直接走 MinerU API VLM。
 - Office：`.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`，直接走 MinerU API VLM。
 
-PDF 默认按 30 页切片并发提交 MinerU，可用 `--pdf-page-chunk-size` 调整。
+PDF 默认按 30 页切片并发提交 MinerU，可用 `--pdf-page-chunk-size` 调整。需要 PPX 时再加 `--enable-ppx`，并可配合 `--mineru-fallback ppx`。
 
 ## 快速使用
 
@@ -211,7 +211,7 @@ preprocess
 
 LLMcheck 可作为其他 agent 调用的文档处理过程：
 
-**多格式输入 → 双引擎采集（MinerU API ∥ 本地 PPX）→ cross 选择初始 MD → 确定性清洗 / 结构 / 门禁 → 仅在 `passed` 时交付 `md/`**
+**多格式输入 → 采集（MinerU API；可选本地 PPX 仅 `--enable-ppx`）→ cross 选择初始 MD → 确定性清洗 / 结构 / 门禁 → 仅在 `passed` 时交付 `md/`**
 
 设计文档：[`docs/prd/2026-07-18-agent-callable-dual-engine-pipeline.md`](docs/prd/2026-07-18-agent-callable-dual-engine-pipeline.md)
 

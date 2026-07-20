@@ -81,7 +81,9 @@ class LlmCheckSettings:
     mineru_request_timeout_seconds: int = DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS
     mineru_max_retries: int = DEFAULT_MINERU_MAX_RETRIES
     mineru_retry_backoff_seconds: float = DEFAULT_MINERU_RETRY_BACKOFF_SECONDS
-    mineru_fallback: str = "ppx"
+    # PPX is opt-in only. Default off to avoid local resource exhaustion.
+    enable_ppx: bool = False
+    mineru_fallback: str = "none"
     pdf_page_chunk_size: int = DEFAULT_PDF_PAGE_CHUNK_SIZE
     ppx_command: str = "/mnt/d/codex/memect-ppx/ppx"
     ppx_cwd: str = "/mnt/d/codex/memect-ppx"
@@ -1937,7 +1939,8 @@ def _preprocess_settings(settings: LlmCheckSettings) -> PreprocessSettings:
         mineru_request_timeout_seconds=max(10, settings.mineru_request_timeout_seconds),
         mineru_max_retries=max(1, settings.mineru_max_retries),
         mineru_retry_backoff_seconds=max(0.0, settings.mineru_retry_backoff_seconds),
-        mineru_fallback=settings.mineru_fallback or "ppx",
+        enable_ppx=bool(getattr(settings, "enable_ppx", False)),
+        mineru_fallback=(settings.mineru_fallback or "none") if bool(getattr(settings, "enable_ppx", False)) else "none",
         pdf_page_chunk_size=max(1, settings.pdf_page_chunk_size),
         ppx_command=settings.ppx_command,
         ppx_cwd=settings.ppx_cwd,

@@ -214,6 +214,7 @@ def test_cli_batch_accepts_prd_operation_flags(tmp_path: Path, monkeypatch) -> N
             "--dry-run",
             "--preflight-only",
             "--skip-existing",
+            "--enable-ppx",
             "--mineru-fallback",
             "ppx",
             "--max-cleanup-loops",
@@ -227,6 +228,7 @@ def test_cli_batch_accepts_prd_operation_flags(tmp_path: Path, monkeypatch) -> N
     assert seen["preflight_only"] is True
     assert seen["skip_existing"] is True
     assert isinstance(settings, LlmCheckSettings)
+    assert settings.enable_ppx is True
     assert settings.mineru_fallback == "ppx"
     assert settings.max_cleanup_loops == 3
 

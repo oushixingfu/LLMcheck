@@ -23,6 +23,25 @@ import zipfile
 from llmcheck.cleaning import safe_stem
 from llmcheck.cross import write_cross_artifacts
 
+# MinerU API rejects files.data_id longer than 128 UTF-8 bytes.
+MINERU_DATA_ID_MAX_BYTES = 128
+
+
+def _mineru_data_id(file_stem: str, index: int) -> str:
+    """Build a stable MinerU data_id within the 128-byte API limit."""
+    suffix = f"_{index:03d}"
+    prefix = "llmcheck_"
+    budget = MINERU_DATA_ID_MAX_BYTES - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8"))
+    stem = safe_stem(file_stem)
+    encoded = stem.encode("utf-8")
+    if len(encoded) > budget:
+        # Truncate on UTF-8 byte boundaries, then append a short hash for uniqueness.
+        digest = hashlib.sha1(encoded).hexdigest()[:8]
+        keep = max(0, budget - 1 - len(digest.encode("utf-8")))
+        truncated = encoded[:keep].decode("utf-8", errors="ignore").rstrip("._-")
+        stem = f"{truncated}_{digest}" if truncated else digest
+    return f"{prefix}{stem}{suffix}"
+
 
 MARKDOWN_SUFFIXES = {".md"}
 PDF_SUFFIXES = {".pdf"}
@@ -33,6 +52,7 @@ SUPPORTED_SUFFIXES = MARKDOWN_SUFFIXES | PDF_SUFFIXES | IMAGE_SUFFIXES | OFFICE_
 DEFAULT_MINERU_BASE_URL = "https://mineru.net"
 DEFAULT_MINERU_MODEL = "vlm"
 DEFAULT_PDF_PAGE_CHUNK_SIZE = 30
+DEFAULT_PDFINFO_TIMEOUT_SECONDS = 90
 DEFAULT_MINERU_BATCH_SIZE = 50
 DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS = 60
 DEFAULT_MINERU_MAX_RETRIES = 3
@@ -72,7 +92,9 @@ class PreprocessSettings:
     mineru_request_timeout_seconds: int = DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS
     mineru_max_retries: int = DEFAULT_MINERU_MAX_RETRIES
     mineru_retry_backoff_seconds: float = DEFAULT_MINERU_RETRY_BACKOFF_SECONDS
-    mineru_fallback: str = "ppx"
+    # PPX is opt-in only. Default off to avoid local resource exhaustion.
+    enable_ppx: bool = False
+    mineru_fallback: str = "none"
     pdf_page_chunk_size: int = DEFAULT_PDF_PAGE_CHUNK_SIZE
     ppx_command: str = DEFAULT_PPX_COMMAND
     ppx_cwd: str = DEFAULT_PPX_CWD
@@ -173,8 +195,15 @@ def page_segments(page_count: int, *, max_pages: int = 200) -> list[tuple[int, i
 
 def pdf_page_count(path: Path) -> int:
     try:
-        completed = subprocess.run(["pdfinfo", str(path)], text=True, capture_output=True, check=False, timeout=15)
-    except FileNotFoundError:
+        completed = subprocess.run(
+            ["pdfinfo", str(path)],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DEFAULT_PDFINFO_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # pdfinfo missing, or slow/encrypted PDFs on WSL/NTFS exceeding timeout.
         return _pdf_page_count_with_pypdf(path)
     match = re.search(r"^Pages:\s+(\d+)", completed.stdout, re.MULTILINE)
     if match:
@@ -578,7 +607,7 @@ def _prepare_pdf_markdown(
         formal_path, cross_report = _finalize_cross_selection(
             work_dir,
             mineru_path=cached_mineru,
-            ppx_path=ppx_path if ppx_path.exists() else None,
+            ppx_path=ppx_path if (_ppx_enabled(settings) and ppx_path.exists()) else None,
         )
         _write_pdf_preprocess_manifest(
             path=path,
@@ -591,7 +620,9 @@ def _prepare_pdf_markdown(
             acquisition_mode=str(cross_report.get("mode") or "mineru_only"),
         )
         return formal_path
-    ppx_path = _start_ppx_audit_background(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
+    ppx_path: Path | None = None
+    if _ppx_enabled(settings):
+        ppx_path = _start_ppx_audit_background(path, work_dir=work_dir, settings=settings, ppx_runner=ppx_runner)
     with ThreadPoolExecutor(max_workers=1) as executor:
         if page_count > settings.pdf_page_chunk_size:
             if pdf_splitter is split_pdf_for_mineru and mineru_runner is run_mineru_vlm:
@@ -633,22 +664,25 @@ def _prepare_pdf_markdown(
                 mineru_error=str(error),
             )
             return formal_path
-    # Pass the expected PPX path even if the background audit is still running;
-    # missing/empty PPX is scored as an unusable dual candidate (selected_mineru).
+    # Pass the expected PPX path only when PPX is enabled; missing/empty PPX is
+    # scored as an unusable dual candidate (selected_mineru / mineru_only).
+    resolved_ppx = None
+    if _ppx_enabled(settings):
+        resolved_ppx = _resolve_ppx_candidate(work_dir, preferred=ppx_path) or ppx_path
     formal_path, cross_report = _finalize_cross_selection(
         work_dir,
         mineru_path=mineru_path,
-        ppx_path=_resolve_ppx_candidate(work_dir, preferred=ppx_path) or ppx_path,
+        ppx_path=resolved_ppx,
     )
     _write_pdf_preprocess_manifest(
         path=path,
         work_dir=work_dir,
         page_count=page_count,
-        ppx_path=ppx_path,
+        ppx_path=ppx_path or (work_dir / "ppx" / "clean" / "ppx.md"),
         mineru_path=mineru_path,
         formal_path=formal_path,
         settings=settings,
-        acquisition_mode=str(cross_report.get("mode") or "selected_mineru"),
+        acquisition_mode=str(cross_report.get("mode") or ("selected_mineru" if resolved_ppx is not None else "mineru_only")),
     )
     return formal_path
 
@@ -754,8 +788,16 @@ def _start_ppx_audit_background(
     return expected_path
 
 
+def _ppx_enabled(settings: PreprocessSettings) -> bool:
+    """Master switch: local PPX is opt-in only (default off)."""
+    return bool(getattr(settings, "enable_ppx", False))
+
+
 def _ppx_fallback_enabled(settings: PreprocessSettings) -> bool:
-    return str(getattr(settings, "mineru_fallback", "ppx") or "ppx").strip().lower() == "ppx"
+    """PPX may be used as MinerU fallback only when explicitly enabled."""
+    if not _ppx_enabled(settings):
+        return False
+    return str(getattr(settings, "mineru_fallback", "none") or "none").strip().lower() == "ppx"
 
 
 def _write_ppx_audit_status(
@@ -1147,7 +1189,7 @@ def _resume_mineru_file_batch(
             MinerUFile(
                 path=file_path,
                 name=str(status.get("file_name") or file_path.name),
-                data_id=str(status.get("data_id") or f"llmcheck_{safe_stem(file_path.stem)}_{index:03d}"),
+                data_id=str(status.get("data_id") or _mineru_data_id(file_path.stem, index)),
             )
         )
     for (_, file_path, output_dir, index), mineru_file in zip(batch, mineru_files, strict=True):
@@ -1262,7 +1304,7 @@ def _run_new_mineru_file_batch(
     client: MinerUClient,
 ) -> dict[int, Path]:
     mineru_files = [
-        MinerUFile(path=file_path, name=file_path.name, data_id=f"llmcheck_{safe_stem(file_path.stem)}_{index:03d}")
+        MinerUFile(path=file_path, name=file_path.name, data_id=_mineru_data_id(file_path.stem, index))
         for _, file_path, _, index in batch
     ]
     batch_id = ""
@@ -1420,7 +1462,7 @@ def _run_one_mineru_file(
             markdown=str(cached_markdown),
         )
         return cached_markdown
-    mineru_file = MinerUFile(path=file_path, name=file_path.name, data_id=f"llmcheck_{safe_stem(file_path.stem)}_{index:03d}")
+    mineru_file = MinerUFile(path=file_path, name=file_path.name, data_id=_mineru_data_id(file_path.stem, index))
     batch_id = _resumable_mineru_batch_id(status_path, file_path=file_path)
     current_status = "polling" if batch_id else "creating_task"
     if batch_id:

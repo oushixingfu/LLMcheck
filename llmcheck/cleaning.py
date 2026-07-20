@@ -135,7 +135,7 @@ def clean_markdown_with_report(
         transform=_normalize_latex_unit_artifacts,
         match_count=len(
             re.findall(
-                r"(?:\$|\\(?:mathrm|mathbf|frac|circ|mu|sim|degree|times|cdot|odot|langle|rangle|leq|geq|leqslant|geqslant|neq|ne|gg|equiv|varrho|pi|clubsuit|star|zeta|triangle|Theta|square))",
+                r"(?:\$|\\(?:mathrm|mathbf|frac|circ|mu|sim|degree|times|cdot|wedge|odot|langle|rangle|leq|geq|leqslant|geqslant|neq|ne|gg|equiv|varrho|pi|clubsuit|star|zeta|triangle|Theta|square))",
                 cleaned,
             )
         ),
@@ -404,8 +404,39 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
         cleaned,
     )
     cleaned = re.sub(
-        r"\\left\\\{\s*array\{[A-Za-z]+\}\s*(?P<body>[^\\\n]{1,120}(?:\\\\[^\\\n]{1,120}){1,8})\s*array\s*\.?",
+        r"\\left\\\{\s*array\{[A-Za-z\s]+\}\s*(?P<body>[^\\\n]{1,160}(?:\\\\[^\\\n]{1,160}){0,12})\s*array\s*\.?",
         lambda match: re.sub(r"\s*\\\\\s*", "；", match.group("body")).strip(),
+        cleaned,
+    )
+    # Flowchart / classification residues: ``\left\{aligned ... aligned.``
+    cleaned = re.sub(
+        r"\\left\\\{\s*aligned\s*(?P<body>[^\\\n]{1,200}(?:\\\\[^\\\n]{1,200}){0,12})\s*aligned\s*\.?",
+        lambda match: re.sub(r"\s*\\\\\s*", "；", match.group("body")).strip(),
+        cleaned,
+    )
+    # Nested array branches that lost the leading ``\left\{`` wrapper.
+    cleaned = re.sub(
+        r"\\left\\\{\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\baligned\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\barray\s*\{[A-Za-z\s]*\}",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"\barray\s*\.?", "", cleaned)
+    # Table cell mid bars from MinerU: ``补土{太渊 \mid 太白}`` → ``补土{太渊 | 太白}``
+    cleaned = re.sub(r"\\mid(?![A-Za-z])", "|", cleaned)
+    # Residual matrix wrappers occasionally left around 奇经八脉 groups.
+    cleaned = re.sub(
+        r"\\?bmatrix(?P<body>[^\\\n]{1,80}(?:\\\\[^\\\n]{1,80}){0,6})bmatrix",
+        lambda match: re.sub(r"\s*\\\\\s*", "、", match.group("body")).strip(),
         cleaned,
     )
     cleaned = re.sub(r"(?<=\d)\s*\^\s*\\prime\s*(?=\s*~\s*\d)", "", cleaned)
@@ -423,12 +454,34 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
     cleaned = re.sub(r"(?<=\d)\\pi\b(?=\s*(?:以|[，,；;。]|$))", "g", cleaned)
     cleaned = re.sub(rf"\\zeta\s*~\s*(?=\d+(?:\.\d+)?\s*(?:{unit_names})\b)", "6~", cleaned)
     cleaned = re.sub(rf"\\dot\s*(?=\d+(?:\.\d+)?\s*(?:{unit_names})\b)", "", cleaned)
+    # MinerU often leaves bare fractions like ``\frac78`` / ``\frac12\frac12`` or
+    # braced ``\frac{7}{8}`` after partial unwraps. Prefer plain text ratios.
+    cleaned = re.sub(
+        r"\\frac\s*\{\s*([0-9]+)\s*\}\s*\{\s*([0-9]+)\s*\}",
+        r"\1/\2",
+        cleaned,
+    )
+    cleaned = re.sub(r"\\frac\s*([0-9])([0-9])(?![0-9A-Za-z])", r"\1/\2", cleaned)
+    # MinerU classification trees: ``\begin{}{l} ... \\ ... \end{}`` / bare ``\begin{}...\end{}``
+    cleaned = re.sub(
+        r"\\begin\s*\{\s*\}\s*(?:\{[A-Za-z\s]*\})?\s*(?P<body>[\s\S]{0,1200}?)\s*\\end\s*\{\s*\}",
+        lambda match: re.sub(r"\s*\\\\\s*", "；", match.group("body")).replace("&", " ").strip(),
+        cleaned,
+    )
+    cleaned = re.sub(r"\\begin\s*\{\s*\}\s*(?:\{[A-Za-z\s]*\})?", "", cleaned)
+    cleaned = re.sub(r"\\end\s*\{\s*\}", "", cleaned)
+    cleaned = re.sub(r"\s*\\\\\s*", "；", cleaned)
+    # Residual branch closers / path separators left by partial array unwraps.
+    cleaned = re.sub(r"\\right\s*\\?\}?\s*\^?\s*(?:\(\s*\d+\s*\)|\d+)?", "", cleaned)
+    cleaned = re.sub(r"\\left\s*\\?\{?", "", cleaned)
+    cleaned = re.sub(r"\\backslash(?![A-Za-z])", "/", cleaned)
     latex_symbols = {
         "degreeC": "℃",
         "degree": "°",
         "circ": "°",
         "times": "×",
         "cdot": "·",
+        "wedge": "∧",
         "odot": "⊙",
         "pm": "±",
         "mu": "μ",
@@ -442,6 +495,7 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
         "Theta": "Θ",
         "dots": "…",
         "ldots": "…",
+        "cdots": "……",
         "bigcirc": "○",
         "square": "□",
         "clubsuit": "♣",
@@ -450,6 +504,9 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
         "langle": "<",
         "rangle": ">",
         "sim": "~",
+        "approx": "≈",
+        "quad": " ",
+        "qquad": " ",
         "rightarrow": "→",
         "to": "→",
         "leq": "≤",
@@ -466,6 +523,9 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
     cleaned = re.sub(r"□\s*\^\s*\(?\s*([0-9]+)\s*\)?", r"(\1)", cleaned)
     cleaned = re.sub(r"□\s*\^\s*([①-⑳ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ])", r"\1", cleaned)
     cleaned = cleaned.replace(r"\%", "%")
+    cleaned = cleaned.replace(r"\,", " ")
+    cleaned = cleaned.replace(r"\;", " ")
+    cleaned = cleaned.replace(r"\!", "")
     cleaned = re.sub(
         rf"\$?\s*(?P<number>\d+(?:\.\d+)?)\s*\\mathrm\s*\{{\s*(?P<unit>{unit_names})\s*\}}\s*\$?",
         lambda match: f" {match.group('number')}{match.group('unit')}",
@@ -486,7 +546,8 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
     previous = None
     while previous != cleaned:
         previous = cleaned
-        cleaned = re.sub(rf"\\(?:{wrapper_commands})\s*\{{\s*([^{{}}\n]{{1,160}})\s*\}}", r"\1", cleaned)
+        # Allow longer prescription rows wrapped as ``\text {…}`` by MinerU OCR.
+        cleaned = re.sub(rf"\\(?:{wrapper_commands})\s*\{{\s*([^{{}}\n]{{1,1200}})\s*\}}", r"\1", cleaned)
     cleaned = re.sub(r"\^\s*\{\s*([^{}\n]{1,32})\s*\}", r"^\1", cleaned)
     cleaned = re.sub(r"_\s*\{\s*([^{}\n]{1,32})\s*\}", r"_\1", cleaned)
     cleaned = re.sub(r"\$\s*([^$\n]{1,120})\s*\$", r"\1", cleaned)
@@ -496,7 +557,7 @@ def _normalize_latex_unit_artifacts(text: str) -> str:
     cleaned = re.sub(r"\b([A-Za-z])\s*/\s*([A-Za-z])\s*=\s*", r"\1/\2=", cleaned)
     cleaned = re.sub(r"([㐀-鿿]{2,8})\n\n(\d+~\d+)", r"\1\2", cleaned)
     cleaned = re.sub(r"\$\s*([^$\n]{0,80}?(?:℃|\d+(?:\.\d+)?(?:g|mg|kg|ug|μg|ml|mL|L|mm|cm|m|min|s|h|kPa)))\s*\$", r"\1", cleaned)
-    cleaned = re.sub(r"\\([A-Za-z]+)\s*\{\s*([^{}\n]{1,160})\s*\}", r"\2", cleaned)
+    cleaned = re.sub(r"\\([A-Za-z]+)\s*\{\s*([^{}\n]{1,1200})\s*\}", r"\2", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\s+(?=\d+(?:\.\d+)?(?:g|mg|kg|ug|μg|ml|mL|L|mm|cm|m|min|s|h|kPa)\b)", " ", cleaned)
     return cleaned
@@ -518,6 +579,14 @@ def _remove_embedded_foreign_math_noise_artifacts(text: str) -> str:
 
     cleaned = theorem_re.sub(replace, text)
     cleaned = re.sub(r"\s*\\therefore\s+[A-Za-z]\s*-\s*\d+\s*\\neq\s*\d+\s*;?\s*", " ", cleaned)
+    # MinerU OCR sometimes injects pure math crumbs into TCM body text:
+    # ``1. \therefore m = -1胎前章…`` / ``\therefore f_1,……,f_n≥ f_n``
+    cleaned = re.sub(
+        r"(?:(?<=\n)|^)\s*(?:\d+\.\s*)?\\therefore\s*[A-Za-z0-9_\\=,\s\.\-\+\<\>\≤\≥………]{0,80}(?=(?:[㐀-鿿]|#|\n|$))",
+        "\n",
+        cleaned,
+    )
+    cleaned = re.sub(r"\\therefore(?![A-Za-z])", "∴", cleaned)
     return re.sub(r"\n{4,}", "\n\n\n", cleaned)
 
 
@@ -894,6 +963,50 @@ def _looks_like_blank_separated_forced_break(
         return False
     if _looks_like_front_matter_line(previous) or _looks_like_front_matter_line(current):
         return False
+    if re.search(
+        r"(?:SS\s*号|出版日期|书名\s*=|作者\s*=|页数\s*=|General Information|ISBN)",
+        current,
+        flags=re.IGNORECASE,
+    ) or re.search(
+        r"(?:SS\s*号|出版日期|书名\s*=|作者\s*=|页数\s*=|General Information|ISBN)",
+        previous,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    # Join incomplete sentence tails that OCR split across a blank line.
+    # Include comma/顿号 tails (``…汤剂、丸剂、`` + blank + ``散剂和膏方…``).
+    incomplete_tail = bool(
+        re.search(r"[㐀-鿿A-Za-z0-9]$", previous) or previous.endswith(("，", ",", "、"))
+    )
+    if (
+        previous
+        and current
+        and not previous.startswith(("#", "|", "-", "*", "+", "!"))
+        and not current.startswith(("#", "|", "-", "*", "+", "!"))
+        and not previous.endswith(tuple("。！？.!?：:；;”』】)）`"))
+        and incomplete_tail
+        and re.search(r"^[㐀-鿿A-Za-z0-9]", current)
+        and not re.match(r"^(?:例|案)\s*[一二三四五六七八九十\d]+", current)
+        and not re.match(r"^(?:例|案)\s*[一二三四五六七八九十\d]+", previous)
+    ):
+        # Skip only pure formula/ingredient rows; prose that happens to begin
+        # with a formula name (``资生丸治疗…`` / ``千金苇茎汤治肺痈…``) must join.
+        # A bare dosage-form word at the start of prose (``散剂和膏方的处理…``) is
+        # NOT a formula unit — periods / clinical verbs already exclude those.
+        pure_formula_current = bool(
+            re.match(r"^[㐀-鿿]{1,12}(?:汤|散|丸|饮|膏|丹|煎)", current)
+            and not re.search(r"[。！？!?；;]", current)
+            and len(current) <= 120
+            and not re.search(r"(?:治疗|患者|疗效|辨证|嘱|观察|关键|不能|则|若|恐|条，|条。)", current)
+        )
+        pure_formula_previous = bool(
+            re.match(r"^[㐀-鿿]{1,12}(?:汤|散|丸|饮|膏|丹|煎)", previous)
+            and not re.search(r"[。！？!?；;]", previous)
+            and previous.count("克") >= 1
+            and len(previous) <= 200
+        )
+        if not pure_formula_current and not pure_formula_previous and len(previous) >= 16:
+            return True
     return _looks_like_forced_break(previous, current, structure_labels=structure_labels)
 
 
@@ -939,6 +1052,14 @@ def _looks_like_forced_break(previous: str, current: str, *, structure_labels: t
     if previous.endswith("年版"):
         return False
     if re.match(r"^([一二三四五六七八九十]+、|\d+[.、])", current):
+        return False
+    # Do not rejoin a new formula name onto the previous formula/ingredient line.
+    if re.match(r"^[㐀-鿿]{2,4}(?:汤|散|丸|饮|膏|丹|煎)(?:\s|$|[㐀-鿿])", current):
+        return False
+    # Never soft-join archive / imprint metadata onto body or formula lines.
+    if re.search(r"(?:SS\s*号|出版日期|书名\s*=|作者\s*=|页数\s*=|General Information|ISBN)", current, flags=re.IGNORECASE):
+        return False
+    if re.search(r"(?:SS\s*号|出版日期|书名\s*=|作者\s*=|页数\s*=|General Information|ISBN)", previous, flags=re.IGNORECASE):
         return False
     return _looks_like_general_paragraph_fragment(previous, current)
 

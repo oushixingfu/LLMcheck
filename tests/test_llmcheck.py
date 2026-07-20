@@ -1251,7 +1251,7 @@ def test_prepare_markdown_inputs_runs_pdf_ppx_and_mineru_vlm(tmp_path: Path) -> 
     rows = prepare_markdown_inputs(
         input_path=pdf,
         output_dir=tmp_path / "out",
-        settings=PreprocessSettings(mineru_api_key="token"),
+        settings=PreprocessSettings(mineru_api_key="token", enable_ppx=True, mineru_fallback="ppx"),
         page_count_reader=fake_page_count,
         pdf_splitter=fake_split,
         ppx_runner=fake_ppx,
@@ -1287,6 +1287,24 @@ def test_pdf_page_count_and_split_fallback_to_pypdf(tmp_path: Path, monkeypatch)
     assert [path.name for path in segments] == ["segment_0001_0002.pdf", "segment_0003_0003.pdf"]
 
 
+def test_pdf_page_count_falls_back_on_pdfinfo_timeout(tmp_path: Path, monkeypatch) -> None:
+    from pypdf import PdfWriter
+
+    source = tmp_path / "slow.pdf"
+    writer = PdfWriter()
+    for _ in range(2):
+        writer.add_blank_page(width=72, height=72)
+    with source.open("wb") as handle:
+        writer.write(handle)
+
+    def fake_run(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="pdfinfo", timeout=kwargs.get("timeout", 1))
+
+    monkeypatch.setattr(preprocess.subprocess, "run", fake_run)
+
+    assert preprocess.pdf_page_count(source) == 2
+
+
 def test_prepare_markdown_inputs_uses_ppx_fallback_when_pdf_mineru_fails(tmp_path: Path) -> None:
     source = tmp_path / "book.pdf"
     source.write_bytes(b"%PDF-1.4\n")
@@ -1310,7 +1328,7 @@ def test_prepare_markdown_inputs_uses_ppx_fallback_when_pdf_mineru_fails(tmp_pat
     rows = prepare_markdown_inputs(
         input_path=source,
         output_dir=output,
-        settings=PreprocessSettings(mineru_api_key="token"),
+        settings=PreprocessSettings(mineru_api_key="token", enable_ppx=True, mineru_fallback="ppx"),
         page_count_reader=fake_pages,
         ppx_runner=fake_ppx,
         mineru_runner=fake_mineru,
@@ -1343,7 +1361,7 @@ def test_prepare_markdown_inputs_uses_ppx_fallback_when_image_mineru_fails(tmp_p
     rows = prepare_markdown_inputs(
         input_path=source,
         output_dir=output,
-        settings=PreprocessSettings(mineru_api_key="token"),
+        settings=PreprocessSettings(mineru_api_key="token", enable_ppx=True, mineru_fallback="ppx"),
         ppx_runner=fake_ppx,
         mineru_runner=fake_mineru,
     )
@@ -1424,6 +1442,40 @@ def test_prepare_markdown_inputs_starts_pdf_ppx_and_mineru_together(tmp_path: Pa
     rows = prepare_markdown_inputs(
         input_path=pdf,
         output_dir=tmp_path / "out",
+        settings=PreprocessSettings(mineru_api_key="token", enable_ppx=True, mineru_fallback="ppx"),
+        page_count_reader=fake_page_count,
+        ppx_runner=fake_ppx,
+        mineru_runner=fake_mineru,
+    )
+
+    assert rows == [tmp_path / "out" / "preprocess" / "book" / "cross" / "initial.md"]
+
+
+def test_prepare_markdown_inputs_skips_ppx_by_default(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    ppx_calls = 0
+
+    def fake_page_count(path: Path) -> int:
+        return 1
+
+    def fake_ppx(path: Path, *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        nonlocal ppx_calls
+        ppx_calls += 1
+        out = output_dir / "clean" / "ppx.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("ppx text", encoding="utf-8")
+        return out
+
+    def fake_mineru(files: list[Path], *, output_dir: Path, settings: PreprocessSettings) -> Path:
+        out = output_dir / "mineru_vlm.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("mineru text", encoding="utf-8")
+        return out
+
+    rows = prepare_markdown_inputs(
+        input_path=pdf,
+        output_dir=tmp_path / "out",
         settings=PreprocessSettings(mineru_api_key="token"),
         page_count_reader=fake_page_count,
         ppx_runner=fake_ppx,
@@ -1431,6 +1483,10 @@ def test_prepare_markdown_inputs_starts_pdf_ppx_and_mineru_together(tmp_path: Pa
     )
 
     assert rows == [tmp_path / "out" / "preprocess" / "book" / "cross" / "initial.md"]
+    assert ppx_calls == 0
+    assert not (tmp_path / "out" / "preprocess" / "book" / "ppx").exists()
+    manifest = json.loads((tmp_path / "out" / "preprocess" / "book" / "preprocess_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["acquisition_mode"] in {"mineru_only", "selected_mineru"}
 
 
 def test_prepare_markdown_inputs_returns_after_mineru_without_waiting_for_ppx(tmp_path: Path) -> None:
@@ -1469,7 +1525,7 @@ def test_prepare_markdown_inputs_returns_after_mineru_without_waiting_for_ppx(tm
                 prepare_markdown_inputs(
                     input_path=pdf,
                     output_dir=tmp_path / "out",
-                    settings=PreprocessSettings(mineru_api_key="token"),
+                    settings=PreprocessSettings(mineru_api_key="token", enable_ppx=True, mineru_fallback="ppx"),
                     page_count_reader=fake_page_count,
                     ppx_runner=fake_ppx,
                     mineru_runner=fake_mineru,
@@ -1594,7 +1650,7 @@ def test_prepare_markdown_inputs_uses_ppx_fallback_for_pdf_without_mineru_key(tm
     rows = prepare_markdown_inputs(
         input_path=pdf,
         output_dir=tmp_path / "out",
-        settings=PreprocessSettings(mineru_api_key="", pdf_page_chunk_size=30),
+        settings=PreprocessSettings(mineru_api_key="", pdf_page_chunk_size=30, enable_ppx=True, mineru_fallback="ppx"),
         page_count_reader=fake_page_count,
         pdf_splitter=fake_split,
         ppx_runner=fake_ppx,
@@ -2248,6 +2304,8 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
                 mineru_request_timeout_seconds=settings.mineru_request_timeout_seconds,
                 mineru_max_retries=settings.mineru_max_retries,
                 mineru_retry_backoff_seconds=settings.mineru_retry_backoff_seconds,
+                enable_ppx=bool(getattr(settings, "enable_ppx", False)),
+                mineru_fallback=settings.mineru_fallback if bool(getattr(settings, "enable_ppx", False)) else "none",
                 pdf_page_chunk_size=settings.pdf_page_chunk_size,
                 ppx_command=settings.ppx_command,
                 ppx_cwd=settings.ppx_cwd,
@@ -2280,6 +2338,8 @@ def test_run_batch_processes_pdf_through_mineru_ppx_llm_and_final_outputs(tmp_pa
             mineru_api_key="token",
             mineru_concurrency=3,
             pdf_page_chunk_size=30,
+            enable_ppx=True,
+            mineru_fallback="ppx",
         ),
         runner=runner,
     )

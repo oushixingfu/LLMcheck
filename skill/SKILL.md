@@ -177,6 +177,8 @@ Use this skill when the user says things like:
 
 ## Notes
 
+- Plain MD upgrades (no MinerU): run structure finalize + local-gate; first-heading/prefix cleanup is part of finalize for textbook exports.
+
 - Runtime dependency: Python ≥3.12 package `LLMcheck` from this repository.
 - **Local PPX is OFF by default.** Only pass `--enable-ppx` (and optionally `--mineru-fallback ppx`) when the user/task explicitly requires PPX. Default dual-start of PPX can freeze the machine.
 - MinerU token is required for non-Markdown conversion without cache.

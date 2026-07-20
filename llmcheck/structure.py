@@ -69,6 +69,22 @@ def finalize_standard_document(text: str) -> dict[str, Any]:
     finalized, removed_book_title_headers = _remove_repeated_book_title_headings(finalized)
     finalized, stripped_heading_page_suffixes = _strip_body_heading_toc_page_suffixes(finalized)
     finalized = _normalize_heading_spacing(finalized)
+    # Final monotonic pass: ensure first heading is H1 and no level jumps remain,
+    # so local-gate cannot fail heading_level_jump after structure cleanup.
+    finalized = _normalize_heading_spacing(_normalize_heading_levels(finalized))
+    # Drop residual non-heading lines before the first heading (textbook TOC banners
+    # that appear after title headings were demoted/removed during cleanup).
+    finalized, removed_late_front_prefix_lines = _remove_unstructured_front_matter_prefix(finalized)
+    if removed_late_front_prefix_lines:
+        finalized = _normalize_heading_spacing(_normalize_heading_levels(finalized))
+    # Promote first heading to H1 last so heading_level_jump cannot reject ##-started bodies.
+    finalized, first_heading_promoted = _ensure_first_heading_is_h1(finalized)
+    if first_heading_promoted:
+        finalized = _normalize_heading_spacing(_normalize_heading_levels(finalized))
+        # keep H1 if normalize demoted it via _standard_heading_level defaults
+        finalized, first_heading_promoted_again = _ensure_first_heading_is_h1(finalized)
+        if first_heading_promoted_again:
+            first_heading_promoted = first_heading_promoted_again
     changes: list[dict[str, object]] = []
     if removed_lines:
         changes.append({"kind": "removed_repeated_lines", "lines": removed_lines})
@@ -78,6 +94,8 @@ def finalize_standard_document(text: str) -> dict[str, Any]:
         changes.append({"kind": "removed_preface_ocr_noise", "lines": removed_preface_lines})
     if removed_front_prefix_lines:
         changes.append({"kind": "removed_unstructured_front_matter_prefix", "lines": removed_front_prefix_lines})
+    if first_heading_promoted:
+        changes.append({"kind": "promoted_first_heading_to_h1", "from_level": first_heading_promoted})
     if removed_embedded_title_page_lines:
         changes.append({"kind": "removed_embedded_series_title_page_after_front_matter", "lines": removed_embedded_title_page_lines})
     if removed_front_imprint_lines:
@@ -644,16 +662,35 @@ def _remove_unstructured_front_matter_prefix(text: str) -> tuple[str, list[str]]
             output_text = "\n".join(output)
             return output_text + ("\n" if output_text else ""), removed
 
+    # Generic: drop non-heading prefix before the first Markdown heading when short.
+    first_heading = _find_first_line(lines, lambda line: bool(re.match(r"^#{1,6}\s+\S", line.strip())))
+    if first_heading is not None and 0 < first_heading <= 80:
+        prefix = lines[:first_heading]
+        nonblank = [line.strip() for line in prefix if line.strip()]
+        if nonblank and all(not re.match(r"^#{1,6}\s+\S", line) and len(line) <= 120 for line in nonblank):
+            # avoid stripping real body paragraphs (long prose) before heading
+            long_prose = sum(1 for line in nonblank if len(line) >= 60 and re.search(r"[。！？]", line))
+            if long_prose == 0:
+                output = lines[first_heading:]
+                output_text = "\n".join(output)
+                return output_text + ("\n" if output_text else ""), nonblank
+
     anchor_index = _find_first_line(lines, _looks_like_usable_front_matter_anchor)
     if anchor_index is None or anchor_index <= 0 or anchor_index > 120:
         return text, []
     prefix = lines[:anchor_index]
     if not _looks_like_unstructured_front_matter_prefix(prefix):
+        nonblank = [line.strip() for line in prefix if line.strip()]
+        if nonblank and all(not re.match(r"^#{1,6}\s+\S", line) and len(line) <= 80 for line in nonblank):
+            output = lines[anchor_index:]
+            output_text = "\n".join(output)
+            return output_text + ("\n" if output_text else ""), nonblank
         return text, []
     output = lines[anchor_index:]
     removed = [line.strip() for line in prefix if line.strip()]
     output_text = "\n".join(output)
     return output_text + ("\n" if output_text else ""), removed
+
 
 
 def _remove_embedded_series_title_page_after_front_matter(text: str) -> tuple[str, list[str]]:
@@ -2421,7 +2458,11 @@ def _normalize_heading_levels(text: str) -> str:
             if _looks_like_dosage_heading_content(content):
                 lines.append(content)
                 continue
-            level = _standard_heading_level(content, default=len(match.group(1)))
+            marker_level = len(match.group(1))
+            level = _standard_heading_level(content, default=marker_level)
+            # Preserve an explicit H1 marker even when content looks like a section (一、...).
+            if marker_level == 1:
+                level = 1
             level = _cap_heading_level_jump(level, previous_heading_level)
             previous_heading_level = level
             lines.append(f"{'#' * level} {content}")
@@ -2449,10 +2490,34 @@ def _normalize_heading_levels(text: str) -> str:
     return "\n".join(lines)
 
 
+
+def _ensure_first_heading_is_h1(text: str) -> tuple[str, int]:
+    """Promote the first Markdown heading to H1 when it starts deeper than H1."""
+    lines = text.splitlines()
+    for index, raw_line in enumerate(lines):
+        match = re.match(r"^(#{1,6})\s+(.+?)$", raw_line.strip())
+        if not match:
+            continue
+        level = len(match.group(1))
+        title = match.group(2).strip()
+        if level <= 1:
+            return text, 0
+        lines[index] = f"# {title}"
+        # After promoting first heading to H1, re-cap subsequent jumps from previous=1
+        # by a second _normalize_heading_levels call at the caller.
+        output = "\n".join(lines)
+        return output + ("\n" if text.endswith("\n") or output else ""), level
+    return text, 0
+
+
 def _cap_heading_level_jump(level: int, previous_level: int) -> int:
     level = min(max(level, 1), 6)
     if previous_level <= 0:
-        return 1
+        # Documents may legitimately start at ## (or deeper) after cover stripping;
+        # only cap relative jumps, do not force the first heading to H1 here.
+        # final_gate still requires the overall heading sequence not to jump more
+        # than +1 from the previous emitted heading.
+        return level
     if level > previous_level + 1:
         return previous_level + 1
     return level

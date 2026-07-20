@@ -896,11 +896,19 @@ def _text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Soft joins must not recreate whole-book mega lines that break semantic units.
+SOFT_JOIN_MAX_LINE_CHARS = 2_000
+
+
 def _merge_soft_wrapped_lines(lines: list[str], *, structure_labels: tuple[str, ...] | None = None) -> list[str]:
     result: list[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped and result and not result[-1].strip():
+            continue
+        # Never soft-join onto or from Markdown headings — headings are unit boundaries.
+        if stripped.startswith("#") or (result and result[-1].strip().startswith("#")):
+            result.append(line)
             continue
         if (
             len(result) >= 2
@@ -915,10 +923,18 @@ def _merge_soft_wrapped_lines(lines: list[str], *, structure_labels: tuple[str, 
                     structure_labels=structure_labels,
                 )
             )
+            and not result[-2].strip().startswith("#")
+            and len(result[-2].rstrip()) + len(stripped) <= SOFT_JOIN_MAX_LINE_CHARS
         ):
             result[-2] = result[-2].rstrip() + stripped
             continue
-        if result and stripped and _looks_like_forced_break(result[-1].strip(), stripped, structure_labels=structure_labels):
+        if (
+            result
+            and stripped
+            and _looks_like_forced_break(result[-1].strip(), stripped, structure_labels=structure_labels)
+            and not result[-1].strip().startswith("#")
+            and len(result[-1].rstrip()) + len(stripped) <= SOFT_JOIN_MAX_LINE_CHARS
+        ):
             result[-1] = result[-1].rstrip() + stripped
         else:
             result.append(line)

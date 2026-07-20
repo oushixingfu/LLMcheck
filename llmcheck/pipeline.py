@@ -748,10 +748,25 @@ def process_one_document(
         if settings.llm_mode in {"review-first", "local-gate"}:
             pre_llm_finalization = finalize_standard_document(cleaned)
             _write_json(finalization_report, pre_llm_finalization)
-            pre_llm_text = clean_markdown_text(str(pre_llm_finalization.get("text") or cleaned))
+            candidate_text = clean_markdown_text(str(pre_llm_finalization.get("text") or cleaned))
+            # Refuse structure collapse: if finalize/clean is worse than cleaned for
+            # semantic-unit metrics, keep cleaned and record the guard decision.
+            pre_llm_text, structure_guard = _prefer_better_structure_text(
+                cleaned=cleaned,
+                candidate=candidate_text,
+            )
+            if structure_guard.get("used_cleaned_fallback"):
+                pre_llm_finalization = {
+                    **pre_llm_finalization,
+                    "structure_guard": structure_guard,
+                    "text": pre_llm_text,
+                }
+                _write_json(finalization_report, pre_llm_finalization)
             pre_llm_path.write_text(pre_llm_text, encoding="utf-8")
             pre_llm_gate = final_acceptance_report(pre_llm_text)
             pre_llm_gate["phase"] = "pre_llm"
+            if structure_guard:
+                pre_llm_gate["structure_guard"] = structure_guard
         quality_payload = {
             "source_path": str(path),
             "cleaned_path": str(cleaned_path),
@@ -1817,6 +1832,59 @@ def _cached_chunk_result(path: Path, chunk: TextChunk, *, report_prefix: str, ex
 
 def _chunk_source_name(source_name: str, chunk: TextChunk) -> str:
     return f"{source_name} 第 {chunk.index}/{chunk.total} 片段"
+
+
+def _structure_metrics(text: str) -> dict[str, int]:
+    lines = text.splitlines()
+    heading_count = sum(1 for line in lines if re.match(r"^#{1,6}\s+\S", line.strip()))
+    max_line = max((len(line) for line in lines), default=0)
+    return {
+        "heading_count": heading_count,
+        "max_line_chars": max_line,
+        "line_count": len(lines),
+        "char_count": len(text),
+    }
+
+
+def _prefer_better_structure_text(*, cleaned: str, candidate: str) -> tuple[str, dict[str, Any]]:
+    """If finalize/clean collapses structure vs cleaned, keep cleaned for delivery.
+
+    Historical skill runs wrote mega-line pre_llm/final while cleaned still had
+    normal headings. Prefer the non-collapsed text so local-gate cannot pass a
+    destroyed semantic-unit layout.
+    """
+    cleaned_metrics = _structure_metrics(cleaned)
+    candidate_metrics = _structure_metrics(candidate)
+    guard: dict[str, Any] = {
+        "cleaned": cleaned_metrics,
+        "candidate": candidate_metrics,
+        "used_cleaned_fallback": False,
+        "reasons": [],
+    }
+    reasons: list[str] = []
+    cleaned_heads = cleaned_metrics["heading_count"]
+    candidate_heads = candidate_metrics["heading_count"]
+    cleaned_max = cleaned_metrics["max_line_chars"]
+    candidate_max = candidate_metrics["max_line_chars"]
+
+    # Candidate grew a mega line while cleaned did not.
+    if candidate_max >= 3_000 and candidate_max > max(cleaned_max * 2, cleaned_max + 500):
+        reasons.append("candidate_mega_line")
+    # Heading structure collapsed (e.g. 100+ heads → few heads).
+    if cleaned_heads >= 10 and candidate_heads < max(5, cleaned_heads // 3):
+        reasons.append("candidate_heading_collapse")
+    # Candidate fails segmentation gate while cleaned is better.
+    candidate_errors = set(quality_errors(candidate))
+    cleaned_errors = set(quality_errors(cleaned))
+    for code in ("mega_line", "low_heading_density", "headingless_long_document"):
+        if code in candidate_errors and code not in cleaned_errors:
+            reasons.append(f"candidate_has_{code}")
+
+    if reasons:
+        guard["used_cleaned_fallback"] = True
+        guard["reasons"] = reasons
+        return cleaned, guard
+    return candidate, guard
 
 
 def _markdown_units(text: str) -> list[str]:

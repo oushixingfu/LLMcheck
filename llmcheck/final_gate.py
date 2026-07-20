@@ -25,6 +25,10 @@ FINAL_BLOCKING_ERROR_CODES = {
     "repeated_toc_heading_residue",
     "unstructured_front_matter_prefix",
     "pdf_md_mismatch",
+    # Semantic-unit delivery contract: block collapsed whole-book mega lines and
+    # long docs whose heading structure was destroyed (few headings left).
+    "mega_line",
+    "low_heading_density",
 }
 QUALITY_ERROR_HINTS = {
     "mojibake": "检测到典型编码乱码，请回到原始文本或 OCR 结果修复后再交付。",
@@ -41,9 +45,16 @@ QUALITY_ERROR_HINTS = {
     "repeated_toc_heading_residue": "检测到重复目录标题，目录应归一为一个 Markdown 章节。",
     "unstructured_front_matter_prefix": "检测到首个 Markdown 标题前残留封面、出版元数据或 OCR 前置块，应先结构化清理。",
     "pdf_md_mismatch": "Markdown 与文字版 PDF 的来源或内容 hash 不一致，需要重新生成交付物。",
+    "mega_line": "检测到超长单行正文（整书/大段粘连），无法按语义单元切分，应回到 cleaned 重建段落与标题。",
+    "low_heading_density": "长文档标题过少，疑似结构在定稿阶段被压扁，不能作为机器可读语义单元交付。",
 }
 HEADINGLESS_LONG_DOCUMENT_MIN_READABLE_CHARS = 2_000
 HEADINGLESS_LONG_DOCUMENT_MIN_LINES = 80
+# Block delivery when any single line is this long (collapsed body signature).
+MEGA_LINE_MAX_CHARS = 3_000
+# Long documents with fewer than this many Markdown headings are treated as collapsed.
+LOW_HEADING_DENSITY_MIN_READABLE_CHARS = 20_000
+LOW_HEADING_DENSITY_MIN_HEADINGS = 5
 DEFAULT_STRUCTURE_LABELS = (
     "头部：",
     "面部：",
@@ -94,6 +105,7 @@ def quality_errors(text: str) -> list[str]:
         errors.append("bad_control_characters")
     errors.extend(error for error in _deterministic_quality_errors(text) if error not in errors)
     errors.extend(error for error in _heading_quality_errors(text) if error not in errors)
+    errors.extend(error for error in _segmentation_quality_errors(text) if error not in errors)
     return errors
 
 
@@ -113,15 +125,22 @@ def quality_hints(text: str) -> dict[str, Any]:
         for index, line in enumerate(text.splitlines(), start=1)
         if len(line.strip()) >= 180 and sum(line.count(char) for char in "，。；：！？、") <= 2
     ]
+    max_line_chars = max((len(line) for line in text.splitlines()), default=0)
+    heading_count = len(_markdown_heading_levels(text))
     return {
         "total_chars": len(text),
         "chinese_chars": chinese_chars,
         "line_count": len(lines),
         "punctuation_count": punctuation_count,
         "punctuation_density": round(punctuation_count / max(1, chinese_chars), 4),
+        "max_line_chars": max_line_chars,
+        "heading_count": heading_count,
         "error_hints": {
             error: QUALITY_ERROR_HINTS[error]
-            for error in _deterministic_quality_errors(text)
+            for error in (
+                *_deterministic_quality_errors(text),
+                *_segmentation_quality_errors(text),
+            )
             if error in QUALITY_ERROR_HINTS
         },
         "forced_line_break_candidate_count": len(forced_line_break_candidates(text)),
@@ -207,6 +226,28 @@ def _heading_quality_errors(text: str) -> list[str]:
     if _has_unstructured_front_matter_prefix(text):
         errors.append("unstructured_front_matter_prefix")
     return errors
+
+
+def _segmentation_quality_errors(text: str) -> list[str]:
+    """Block delivery shapes that pass heading syntax but destroy semantic units."""
+    errors: list[str] = []
+    if _has_mega_line(text):
+        errors.append("mega_line")
+    if _has_low_heading_density(text):
+        errors.append("low_heading_density")
+    return errors
+
+
+def _has_mega_line(text: str) -> bool:
+    return any(len(line) >= MEGA_LINE_MAX_CHARS for line in text.splitlines())
+
+
+def _has_low_heading_density(text: str) -> bool:
+    readable_chars = len(re.findall(r"[㐀-鿿A-Za-z0-9]", text))
+    if readable_chars < LOW_HEADING_DENSITY_MIN_READABLE_CHARS:
+        return False
+    heading_count = len(_markdown_heading_levels(text))
+    return heading_count < LOW_HEADING_DENSITY_MIN_HEADINGS
 
 
 

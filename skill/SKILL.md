@@ -35,9 +35,11 @@ llmcheck agent profiles
 
 1. Prefer `llmcheck agent convert|status|get-md|profiles` (JSON on stdout).
 2. Only trust final Markdown under `md/` when document `status == "passed"`.
-3. Never treat `process/drafts/**` as delivery content.
-4. Credentials come from environment variables — do not hardcode secrets.
-5. Keep `--output-dir` outside the source tree when possible.
+3. **`passed` is not enough for semantic use:** delivery MD must be machine-readable **semantic units** (heading hierarchy + body under each body heading; no whole-book mega-line collapse). Spot-check `max_line`, heading count, and empty shells before treating a book as QA/claim-ready.
+4. Never treat `process/drafts/**` as delivery content.
+5. If structure collapsed after convert (few headings, mega-line body) while `process/clean/*.cleaned.md` still looks structured: **rebuild from cleaned / re-run local-gate after code fix — do not re-run MinerU by default**.
+6. Credentials come from environment variables — do not hardcode secrets.
+7. Keep `--output-dir` outside the source tree when possible.
 
 ## Credentials (env)
 
@@ -94,12 +96,30 @@ md = agent_api.get_final_markdown(output_dir="/path/to/output", document_id=doc_
 upload/path
 → acquisition (MinerU API; optional local PPX only if --enable-ppx)
 → Cross Select → process/.../cross/initial.md
-→ deterministic clean + structure
-→ pre-LLM gate
+→ deterministic clean → process/.../clean/*.cleaned.md
+→ structure finalize (must not collapse headings into mega-lines)
+→ pre-LLM gate (includes mega_line / low_heading_density)
 → optional LLM (local-gate skips)
 → final gate
 → md/ only if accepted
 ```
+
+**Delivery contract (semantic units):**
+
+- Hierarchy should support later QA/claim extraction (`#` major / `##` section / `###` entry as profile allows).
+- Body headings should carry complete following content until the next heading (no intentional empty shells except true parents).
+- Soft line-join must not glue an entire book into one line.
+- If pre_llm/final is worse than cleaned on heading count / max line length, pipeline prefers cleaned (structure guard).
+
+## Delivery policy
+
+| Status | Agent may use |
+|--------|----------------|
+| `passed` | `md/<id>.md` via path or `get-md` body — still spot-check structure before large-scale extraction |
+| `review_required` / `failed` / `pre_llm_quality_failed` | reports under `process/` only — no final body |
+| collapsed body but cleaned OK | re-run convert/local-gate after fix, or rebuild from `process/clean/*.cleaned.md`; **do not re-MinerU first** |
+
+`get-md` returns text only for passed documents.
 
 ## JobReport (`schema_version=1.0`)
 
@@ -132,15 +152,6 @@ upload/path
 - `0` — passed / successful read
 - `1` — review_required, failed, or non-passed get-md
 - `2` — clear config/input error
-
-## Delivery policy
-
-| Status | Agent may use |
-|--------|----------------|
-| `passed` | `md/<id>.md` via path or `get-md` body |
-| `review_required` / `failed` | reports under `process/` only — no final body |
-
-`get-md` returns text only for passed documents.
 
 ## Profiles
 

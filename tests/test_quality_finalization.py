@@ -2068,6 +2068,63 @@ def test_final_acceptance_report_blocks_headingless_long_document() -> None:
     assert "headingless_long_document" in report["blocking_errors"]
 
 
+def test_final_acceptance_report_blocks_mega_line_with_single_heading() -> None:
+    # One legitimate heading is not enough if the body is a whole-book mega line.
+    mega_body = "这是粘连正文。" * 500  # 3500 chars
+    text = f"# 目录\n\n{mega_body}\n"
+
+    report = final_acceptance_report(text)
+
+    assert report["accepted"] is False
+    assert "mega_line" in report["blocking_errors"]
+    assert report["hints"]["max_line_chars"] >= 3000
+
+
+def test_final_acceptance_report_blocks_low_heading_density() -> None:
+    # Long document with only a handful of headings (collapsed structure signature).
+    # Keep each line short so mega_line does not dominate the failure mode.
+    parts = [f"正文段落，包含标点。段落{i}。" for i in range(3000)]
+    body = "\n\n".join(parts)
+    text = "# 前言\n\n说明。\n\n# 目录\n\n- 条目\n\n# 正文\n\n" + body + "\n\n# 附录\n\n结束。\n"
+
+    report = final_acceptance_report(text)
+
+    assert report["accepted"] is False
+    assert "low_heading_density" in report["blocking_errors"]
+    assert report["hints"]["heading_count"] < 5
+    assert report["hints"]["max_line_chars"] < 3000
+
+
+def test_soft_join_does_not_cross_headings_or_exceed_cap() -> None:
+    from llmcheck.cleaning import _merge_soft_wrapped_lines
+
+    # Adjacent prose would join, but heading boundary must stay.
+    lines = [
+        "这是上一段没有句号",
+        "# 下一节",
+        "从这里开始新的段落内容仍然很长",
+    ]
+    merged = _merge_soft_wrapped_lines(lines)
+    assert any(line.strip().startswith("# 下一节") for line in merged)
+
+    # Soft join must not produce an unbounded mega line.
+    left = "甲" * 1900
+    right = "乙" * 200
+    merged_long = _merge_soft_wrapped_lines([left, right])
+    assert max(len(line) for line in merged_long) <= 2100
+
+
+def test_prefer_better_structure_text_keeps_cleaned_on_collapse() -> None:
+    from llmcheck.pipeline import _prefer_better_structure_text
+
+    cleaned = "# 章一\n\n" + "\n\n".join(f"## 节{i}\n\n内容{i}。" for i in range(1, 40))
+    collapsed = "# 目录\n\n" + ("粘连正文。" * 5000)
+    chosen, guard = _prefer_better_structure_text(cleaned=cleaned, candidate=collapsed)
+    assert guard["used_cleaned_fallback"] is True
+    assert chosen == cleaned
+    assert "candidate_mega_line" in guard["reasons"] or "candidate_heading_collapse" in guard["reasons"]
+
+
 def test_final_acceptance_report_provides_quality_hints() -> None:
     text = "正文段落。\n"
 

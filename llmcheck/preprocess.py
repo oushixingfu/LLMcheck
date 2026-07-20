@@ -237,13 +237,26 @@ def _pdf_page_count_with_pypdf(path: Path) -> int:
 def _write_pdf_segment(*, source_path: Path, start: int, end: int, segment_path: Path) -> None:
     segment_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(
-            ["qpdf", "--empty", "--pages", str(source_path), f"{start}-{end}", "--", str(segment_path)],
+        # qpdf may exit non-zero with warnings on legacy/FreePic2Pdf PDFs.
+        # --warning-exit-0 makes warning-only runs exit 0; still fall back to
+        # pypdf if the segment file is missing or empty.
+        completed = subprocess.run(
+            [
+                "qpdf",
+                "--warning-exit-0",
+                "--empty",
+                "--pages",
+                str(source_path),
+                f"{start}-{end}",
+                "--",
+                str(segment_path),
+            ],
             text=True,
             capture_output=True,
-            check=True,
+            check=False,
         )
-        return
+        if segment_path.exists() and segment_path.stat().st_size > 0 and completed.returncode in (0, 3):
+            return
     except FileNotFoundError:
         pass
     from pypdf import PdfReader, PdfWriter

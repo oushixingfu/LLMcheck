@@ -88,7 +88,7 @@ class PreprocessSettings:
     mineru_concurrency: int = 2
     mineru_batch_size: int = DEFAULT_MINERU_BATCH_SIZE
     mineru_poll_interval_seconds: int = 3
-    mineru_timeout_seconds: int = 3600
+    mineru_timeout_seconds: int = 7200
     mineru_request_timeout_seconds: int = DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS
     mineru_max_retries: int = DEFAULT_MINERU_MAX_RETRIES
     mineru_retry_backoff_seconds: float = DEFAULT_MINERU_RETRY_BACKOFF_SECONDS

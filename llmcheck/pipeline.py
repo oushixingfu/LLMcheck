@@ -75,7 +75,7 @@ class LlmCheckSettings:
     mineru_api_url: str = "https://mineru.net"
     mineru_api_key: str = ""
     mineru_model: str = "vlm"
-    mineru_concurrency: int = 12
+    mineru_concurrency: int = 2
     mineru_batch_size: int = DEFAULT_MINERU_BATCH_SIZE
     mineru_timeout_seconds: int = 3600
     mineru_request_timeout_seconds: int = DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS

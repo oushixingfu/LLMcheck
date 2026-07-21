@@ -238,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
     agent_convert.add_argument("--mineru-api-key", default="")
     agent_convert.add_argument("--enable-ppx", action="store_true", help="Opt-in local PPX (default off; only when the task explicitly requires PPX).")
     agent_convert.add_argument("--mineru-fallback", choices=("ppx", "none"), default="none", help="Only used with --enable-ppx.")
+    agent_convert.add_argument("--pdf-page-chunk-size", type=int, default=50, help="PDF split page size for MinerU (<=50 recommended)")
+    agent_convert.add_argument("--mineru-concurrency", type=int, default=2, help="Parallel MinerU segment uploads")
+    agent_convert.add_argument("--mineru-batch-size", type=int, default=8, help="MinerU files per batch request")
     agent_status = agent_sub.add_parser("status", help="Read JobReport for an output directory.")
     agent_status.add_argument("--output-dir", required=True, type=Path)
     agent_get_md = agent_sub.add_parser("get-md", help="Return final Markdown only when document status is passed.")
@@ -364,6 +367,9 @@ def _run_agent_command(args: argparse.Namespace) -> int:
                 concurrency=args.concurrency,
                 enable_ppx=enable_ppx,
                 mineru_fallback=(getattr(args, "mineru_fallback", "none") if enable_ppx else "none"),
+                pdf_page_chunk_size=int(getattr(args, "pdf_page_chunk_size", 50) or 50),
+                mineru_concurrency=int(getattr(args, "mineru_concurrency", 2) or 2),
+                mineru_batch_size=int(getattr(args, "mineru_batch_size", 8) or 8),
             )
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report.get("status") == "passed" else 1

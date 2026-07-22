@@ -85,6 +85,19 @@ def finalize_standard_document(text: str) -> dict[str, Any]:
         finalized, first_heading_promoted_again = _ensure_first_heading_is_h1(finalized)
         if first_heading_promoted_again:
             first_heading_promoted = first_heading_promoted_again
+    # Batch-proven repairs (forced breaks, mis-headings, latex crumbs, long lines).
+    # Gate thresholds unchanged; this only improves pass rate on OCR/textbook exports.
+    from llmcheck.repair import apply_batch_proven_repairs
+    from llmcheck.cleaning import clean_markdown_text as _clean_after_repair
+    finalized, batch_repair_labels = apply_batch_proven_repairs(finalized)
+    if batch_repair_labels:
+        finalized = _clean_after_repair(finalized)
+        finalized = _normalize_heading_spacing(_normalize_heading_levels(finalized))
+        finalized, first_heading_promoted_again = _ensure_first_heading_is_h1(finalized)
+        if first_heading_promoted_again and not first_heading_promoted:
+            first_heading_promoted = first_heading_promoted_again
+    else:
+        batch_repair_labels = []
     changes: list[dict[str, object]] = []
     if removed_lines:
         changes.append({"kind": "removed_repeated_lines", "lines": removed_lines})

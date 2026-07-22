@@ -2161,3 +2161,60 @@ def test_rule_registry_entries_have_required_fields() -> None:
         assert rule.description
         assert rule.risk_level in {"low", "medium", "high"}
         assert rule.write_mode in {"auto_apply", "report_only", "block"}
+
+
+def test_batch_proven_repairs_merge_forced_breaks() -> None:
+    from llmcheck.repair import merge_forced_breaks
+    from llmcheck.final_gate import final_acceptance_report
+
+    text = "这是一个普通段落的第一部分仍然没有结束\n第二部分继续同一句直到结束。\n"
+    fixed = merge_forced_breaks(text)
+    assert "第一部分仍然没有结束第二部分继续" in fixed.replace(" ", "")
+    rep = final_acceptance_report("# 标题\n\n" + fixed + "\n")
+    assert "forced_line_breaks" not in rep["blocking_errors"]
+
+
+def test_batch_proven_repairs_demote_toc_latex() -> None:
+    from llmcheck.repair import (
+        demote_nonstandard_headings,
+        fix_toc_page_headings,
+        strip_latex_artifacts,
+        apply_batch_proven_repairs,
+    )
+
+    demoted = demote_nonstandard_headings("## ※※※\n\n正文段落。\n")
+    assert "※※※" in demoted
+    assert not any(line.strip().startswith("## ※") for line in demoted.splitlines())
+
+    toc = fix_toc_page_headings("## 头痛 …… 12\n\n# 正文\n\n说明文字。\n")
+    assert toc.splitlines()[0].startswith("- ")
+
+    latex = strip_latex_artifacts("体温 $37$ \\mathrm{C} 正常。\n")
+    assert "$" not in latex
+    assert "mathrm" not in latex
+
+    text = "# 标题\n\n上半句没有结束\n下半句才结束。\n"
+    fixed, labels = apply_batch_proven_repairs(text)
+    assert isinstance(labels, list)
+    assert isinstance(fixed, str)
+
+
+def test_finalize_runs_batch_proven_repairs_accepts_forced_wrap() -> None:
+    from llmcheck.structure import finalize_standard_document
+    from llmcheck.final_gate import final_acceptance_report
+
+    raw = "# 导言\n\n这是一个普通段落的第一部分仍然没有结束\n第二部分继续同一句直到结束。\n"
+    result = finalize_standard_document(raw)
+    text = str(result.get("text") or "")
+    rep = final_acceptance_report(text)
+    assert rep["accepted"] is True
+    assert "forced_line_breaks" not in rep["blocking_errors"]
+
+
+def test_split_overlong_lines_under_pack_limit() -> None:
+    from llmcheck.repair import split_overlong_lines
+
+    line = (("论述内容，" * 20) + "。") * 30
+    assert len(line) > 2500
+    fixed = split_overlong_lines("# 题\n\n" + line + "\n", max_len=2490)
+    assert max(len(l) for l in fixed.splitlines()) <= 2490

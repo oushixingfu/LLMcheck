@@ -177,6 +177,8 @@ Use this skill when the user says things like:
 
 ## Notes
 
+- Post-finalize batch repairs (in `llmcheck/repair.py`) run automatically: merge OCR forced breaks, demote nonstandard headings, fix TOC page headings, strip residual latex crumbs, split overlong body lines. Gate thresholds are unchanged (`mega_line` still 3000).
+
 - Plain MD upgrades (no MinerU): run structure finalize + local-gate; first-heading/prefix cleanup is part of finalize for textbook exports.
 
 - Runtime dependency: Python ≥3.12 package `LLMcheck` from this repository.
